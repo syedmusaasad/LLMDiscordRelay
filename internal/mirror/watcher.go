@@ -647,8 +647,9 @@ func (w *Watcher) mirrorContent(parent context.Context, sessionID, threadID, tmu
 			if inject.IsPermissionPrompt(pane) {
 				signature := inject.PermissionSignature(pane)
 				if signature != approvalSignature && !w.pendingInteractions.has(threadID, tmuxTarget, "approval") {
-					approvalSignature = signature
-					w.postApproval(threadID, tmuxTarget, signature)
+					if w.postApproval(threadID, tmuxTarget, signature) {
+						approvalSignature = signature
+					}
 				}
 			} else {
 				approvalSignature = ""
@@ -656,8 +657,9 @@ func (w *Watcher) mirrorContent(parent context.Context, sessionID, threadID, tmu
 			if q, ok := inject.ParseQuestion(pane); ok {
 				signature := q.Prompt + "\x00" + strings.Join(q.Options, "\x00")
 				if signature != questionSignature && !w.pendingInteractions.has(threadID, tmuxTarget, "question") {
-					questionSignature = signature
-					w.postQuestion(threadID, tmuxTarget, q)
+					if w.postQuestion(threadID, tmuxTarget, q) {
+						questionSignature = signature
+					}
 				}
 			} else {
 				questionSignature = ""
@@ -1056,9 +1058,13 @@ func isTmuxPaneAlive(target string) bool {
 	return err == nil
 }
 
-func (w *Watcher) postApproval(threadID, target, signature string) {
-	approveID := fmt.Sprintf("approval:approve:%d", time.Now().UnixNano())
-	denyID := fmt.Sprintf("approval:deny:%d", time.Now().UnixNano())
+// postApproval posts the Approve/Deny buttons for a permission prompt. It
+// reports whether the message was delivered; callers must only remember the
+// prompt signature on success so a failed post is retried on the next poll.
+func (w *Watcher) postApproval(threadID, target, signature string) bool {
+	stamp := time.Now().UnixNano()
+	approveID := fmt.Sprintf("approval:approve:%d", stamp)
+	denyID := fmt.Sprintf("approval:deny:%d", stamp)
 	content := "⚠️ **Permission required**\nApprove this Claude Code action?"
 	if signature != "" {
 		detail := signature
@@ -1073,7 +1079,7 @@ func (w *Watcher) postApproval(threadID, target, signature string) {
 	})
 	if err != nil {
 		log.Printf("mirror: post approval: %v", err)
-		return
+		return false
 	}
 	entry := pendingInteraction{target: target, threadID: threadID, messageID: msg.ID, kind: "approval"}
 	w.pendingInteractions.put(approveID, entry)
@@ -1098,9 +1104,12 @@ func (w *Watcher) postApproval(threadID, target, signature string) {
 			}
 		}
 	}()
+	return true
 }
 
-func (w *Watcher) postQuestion(threadID, target string, q inject.Question) {
+// postQuestion posts the option picker for an AskUserQuestion prompt and
+// reports whether it was delivered.
+func (w *Watcher) postQuestion(threadID, target string, q inject.Question) bool {
 	id := fmt.Sprintf("question:select:%d", time.Now().UnixNano())
 	options := make([]ComponentOption, 0, len(q.Options))
 	for i, option := range q.Options {
@@ -1111,9 +1120,10 @@ func (w *Watcher) postQuestion(threadID, target string, q inject.Question) {
 	}})
 	if err != nil {
 		log.Printf("mirror: post question picker: %v", err)
-		return
+		return false
 	}
 	w.pendingInteractions.put(id, pendingInteraction{target: target, threadID: threadID, messageID: msg.ID, kind: "question", options: len(q.Options)})
+	return true
 }
 
 // askTrust surfaces Claude Code's folder-trust dialog to Discord as an approval
@@ -1197,21 +1207,23 @@ func (w *Watcher) handleInteraction(ev InteractionEvent) {
 		_ = w.discordEditComponents(entry.threadID, entry.messageID, note, nil)
 		entry.result <- approve
 	case "approval":
-		if strings.Contains(ev.CustomID, ":approve:") {
-			if err := tmuxctl.SendRecipe(entry.target, tmuxctl.ApprovalApproveRecipe); err != nil {
-				log.Printf("mirror: approve recipe: %v", err)
-				return
-			}
-			w.pendingInteractions.take(strings.Replace(ev.CustomID, ":approve:", ":deny:", 1))
-			_ = w.discordEditComponents(entry.threadID, entry.messageID, "✅ **Permission approved**.", nil)
+		approve := strings.Contains(ev.CustomID, ":approve:")
+		other := strings.Replace(ev.CustomID, ":approve:", ":deny:", 1)
+		recipe, note := tmuxctl.ApprovalDenyRecipe, "⛔ **Permission denied**."
+		if approve {
+			recipe, note = tmuxctl.ApprovalApproveRecipe, "✅ **Permission approved**."
+		} else {
+			other = strings.Replace(ev.CustomID, ":deny:", ":approve:", 1)
+		}
+		if err := tmuxctl.SendRecipe(entry.target, recipe); err != nil {
+			log.Printf("mirror: approval recipe: %v", err)
+			w.pendingInteractions.put(ev.CustomID, entry) // keep the button usable
 			return
 		}
-		if err := tmuxctl.SendRecipe(entry.target, tmuxctl.ApprovalDenyRecipe); err != nil {
-			log.Printf("mirror: deny recipe: %v", err)
-			return
-		}
-		w.pendingInteractions.take(strings.Replace(ev.CustomID, ":deny:", ":approve:", 1))
-		_ = w.discordEditComponents(entry.threadID, entry.messageID, "⛔ **Permission denied**.", nil)
+		// Both buttons share one stamp: resolving either retires the pair, which
+		// also disarms the timeout goroutine (it finds nothing to take).
+		w.pendingInteractions.take(other)
+		_ = w.discordEditComponents(entry.threadID, entry.messageID, note, nil)
 	case "question":
 		if len(ev.Values) != 1 {
 			return
