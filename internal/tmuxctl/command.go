@@ -72,7 +72,7 @@ func NewBirthCommand(tmuxBin string, args ...string) (*exec.Cmd, string) {
 	if mode == "systemd-user-scope" {
 		wrapped := []string{"--user", "--scope", "--collect"}
 		// systemd-run --user starts the scope from the manager environment, not
-		// necessarily this dpmux process's environment.  Forward the values a
+		// necessarily this llmux process's environment.  Forward the values a
 		// tmux birth needs explicitly, both to the transient scope and to the
 		// tmux client itself.  In particular, RELAY_STATE_DIR contains the
 		// durable pending marker that must be visible before the child starts.

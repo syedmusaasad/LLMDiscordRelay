@@ -1,4 +1,4 @@
-// Package tmuxctl wraps tmux commands for managing devpass-code sessions.
+// Package tmuxctl wraps tmux commands for managing Claude Code sessions.
 // It provides functions to create windows, send keys, and capture pane text.
 package tmuxctl
 

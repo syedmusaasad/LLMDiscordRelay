@@ -64,7 +64,10 @@ type Event struct {
 	ToolName  string // KindToolCall
 	ToolID    string // KindToolCall, KindToolResult
 	IsError   bool   // KindToolResult
-	Model     string // assistant lines: the model that produced them
+	// Interrupted is set on a KindTurnEnd that came from an interrupt (Esc, or
+	// "No" on a permission prompt) rather than a completed turn.
+	Interrupted bool
+	Model       string // assistant lines: the model that produced them
 }
 
 // line is the subset of a transcript line the relay reads.
@@ -191,7 +194,7 @@ func ParseLine(raw []byte) []Event {
 
 func userText(l line, ts time.Time, s string) []Event {
 	if strings.HasPrefix(strings.TrimSpace(s), interruptPrefix) {
-		return []Event{{Kind: KindTurnEnd, UUID: l.UUID, MessageID: l.UUID, Time: ts}}
+		return []Event{{Kind: KindTurnEnd, UUID: l.UUID, MessageID: l.UUID, Time: ts, Interrupted: true}}
 	}
 	if isHarnessText(s) || strings.TrimSpace(s) == "" {
 		return nil
@@ -280,6 +283,10 @@ type Tailer struct {
 	store        Store
 	sessionID    string
 	pollInterval time.Duration
+	// StartOffset, when non-zero, skips the first StartOffset bytes of the file
+	// (used to follow only new activity after a resume). It must sit on a line
+	// boundary, which Store.Size guarantees for a quiescent transcript.
+	StartOffset int64
 }
 
 // NewTailer creates a Tailer for sessionID.
@@ -300,7 +307,7 @@ func (t *Tailer) Tail(ctx context.Context) <-chan Event {
 		if err != nil {
 			return
 		}
-		var offset int64
+		offset := t.StartOffset
 		var pending []byte
 		ticker := time.NewTicker(t.pollInterval)
 		defer ticker.Stop()
@@ -355,6 +362,20 @@ func readNew(path string, offset int64, pending []byte) (int64, []byte, []Event)
 		buf = buf[i+1:]
 	}
 	return offset, append([]byte(nil), buf...), events
+}
+
+// Size returns the current byte length of sessionID's transcript, or 0 when it
+// does not exist yet.
+func (s Store) Size(sessionID string) int64 {
+	p, err := s.Path(sessionID)
+	if err != nil {
+		return 0
+	}
+	fi, err := os.Stat(p)
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
 }
 
 // ReadAll parses a whole transcript file.

@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+
+	"github.com/syedmusaasad/LLMDiscordRelay/internal/transcript"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,7 +18,7 @@ func TestUpdateSourceUsesInstallMarker(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, ".git"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	marker := filepath.Join(home, ".config", "devpass-discord-relay", "install-source")
+	marker := filepath.Join(home, ".config", "llm-discord-relay", "install-source")
 	if err := os.MkdirAll(filepath.Dir(marker), 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +63,7 @@ func newUpdateRepo(t *testing.T) *updateRepo {
 
 	checkout := filepath.Join(t.TempDir(), "checkout")
 	runGit(t, "clone", bare, checkout)
-	marker := filepath.Join(home, ".config", "devpass-discord-relay", "install-source")
+	marker := filepath.Join(home, ".config", "llm-discord-relay", "install-source")
 	if err := os.MkdirAll(filepath.Dir(marker), 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +74,7 @@ func newUpdateRepo(t *testing.T) *updateRepo {
 	return &updateRepo{home: home, seed: seed, checkout: checkout, latest: latest}
 }
 
-func TestDpmuxUpdate_ChecksOutLatestTag(t *testing.T) {
+func TestLlmuxUpdate_ChecksOutLatestTag(t *testing.T) {
 	r := newUpdateRepo(t)
 	if err := runUpdate(); err != nil {
 		t.Fatal(err)
@@ -81,9 +84,9 @@ func TestDpmuxUpdate_ChecksOutLatestTag(t *testing.T) {
 	}
 }
 
-// TestDpmuxUpdate_FollowsMovedLatestTag moves the latest tag in the remote after
+// TestLlmuxUpdate_FollowsMovedLatestTag moves the latest tag in the remote after
 // the clone already holds the old tag; a plain `git fetch --tags` would keep it.
-func TestDpmuxUpdate_FollowsMovedLatestTag(t *testing.T) {
+func TestLlmuxUpdate_FollowsMovedLatestTag(t *testing.T) {
 	r := newUpdateRepo(t)
 	if err := runUpdate(); err != nil {
 		t.Fatal(err)
@@ -110,10 +113,10 @@ func TestDpmuxUpdate_FollowsMovedLatestTag(t *testing.T) {
 	}
 }
 
-// TestDpmuxUpdate_ReplacesRunningBinary keeps copies of real executables running
+// TestLlmuxUpdate_ReplacesRunningBinary keeps copies of real executables running
 // from the install paths while the update runs. Truncating a running executable
 // fails with ETXTBSY; temp-file-plus-rename must succeed.
-func TestDpmuxUpdate_ReplacesRunningBinary(t *testing.T) {
+func TestLlmuxUpdate_ReplacesRunningBinary(t *testing.T) {
 	// Resolve a real, non-multicall executable before newUpdateRepo narrows PATH.
 	shPath, err := exec.LookPath("sh")
 	if err != nil {
@@ -131,7 +134,7 @@ func TestDpmuxUpdate_ReplacesRunningBinary(t *testing.T) {
 	if err := os.MkdirAll(binDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"relay", "dpmux"} {
+	for _, name := range []string{"relay", "llmux"} {
 		dest := filepath.Join(binDir, name)
 		if err := os.WriteFile(dest, src, 0755); err != nil {
 			t.Fatal(err)
@@ -155,7 +158,7 @@ func TestDpmuxUpdate_ReplacesRunningBinary(t *testing.T) {
 	if err := runUpdate(); err != nil {
 		t.Fatalf("update with running binaries: %v", err)
 	}
-	for _, name := range []string{"relay", "dpmux"} {
+	for _, name := range []string{"relay", "llmux"} {
 		got, err := os.ReadFile(filepath.Join(binDir, name))
 		if err != nil || string(got) != "latest" {
 			t.Fatalf("installed %s = %q, %v; want rebuilt %q", name, got, err, "latest")
@@ -188,7 +191,7 @@ func updateTestPath(t *testing.T) string {
 
 func writeUpdateFixture(t *testing.T, root, version string) {
 	t.Helper()
-	makefile := "build:\n\tmkdir -p bin\n\tprintf '" + version + "' > bin/relay\n\tprintf '" + version + "' > bin/dpmux\n"
+	makefile := "build:\n\tmkdir -p bin\n\tprintf '" + version + "' > bin/relay\n\tprintf '" + version + "' > bin/llmux\n"
 	if err := os.WriteFile(filepath.Join(root, "Makefile"), []byte(makefile), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -208,4 +211,103 @@ func runGitAt(t *testing.T, dir string, args ...string) string {
 		t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
 	}
 	return string(out)
+}
+
+func TestPlanLaunchNewSessionUsesFreshUUID(t *testing.T) {
+	plan, err := planLaunch([]string{"--model", "haiku"}, newSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Resume || !transcript.ValidSessionID(plan.SessionID) {
+		t.Fatalf("plan = %+v", plan)
+	}
+	want := []string{"--session-id", plan.SessionID, "--model", "haiku"}
+	if strings.Join(plan.Args, " ") != strings.Join(want, " ") {
+		t.Fatalf("args = %v, want %v", plan.Args, want)
+	}
+	other, _ := planLaunch(nil, newSessionID)
+	if other.SessionID == plan.SessionID {
+		t.Fatal("session ids must be unique per launch")
+	}
+	// RFC 4122 v4 shape.
+	if id := plan.SessionID; id[14] != '4' || !strings.ContainsRune("89ab", rune(id[19])) {
+		t.Fatalf("not a v4 uuid: %s", id)
+	}
+}
+
+func TestPlanLaunchResume(t *testing.T) {
+	id := "11111111-2222-4333-8444-555555555555"
+	for _, args := range [][]string{{"--resume", id}, {"--resume=" + id}} {
+		plan, err := planLaunch(args, newSessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !plan.Resume || plan.SessionID != id || strings.Join(plan.Args, " ") != "--resume "+id {
+			t.Fatalf("plan = %+v", plan)
+		}
+	}
+	for _, bad := range [][]string{{"--resume"}, {"--resume", "not-a-uuid"}, {"--resume", "*"}, {"--resume", "../x"}} {
+		if _, err := planLaunch(bad, newSessionID); err == nil {
+			t.Errorf("planLaunch(%v) succeeded, want refusal", bad)
+		}
+	}
+}
+
+func TestBuildAgentCmd(t *testing.T) {
+	t.Setenv("RELAY_STATE_DIR", "/tmp/it's state")
+	t.Setenv("RELAY_CLAUDE_PROJECTS", "")
+	t.Setenv("FAKE_CLAUDE_UNTRUSTED", "1")
+	got := buildAgentCmd([]string{"/usr/bin/claude", "--model", "haiku"}, []string{"--session-id", "abc"})
+	want := `env RELAY_STATE_DIR='/tmp/it'\''s state' FAKE_CLAUDE_UNTRUSTED='1' '/usr/bin/claude' '--model' 'haiku' '--session-id' 'abc'`
+	if got != want {
+		t.Fatalf("cmd = %s\nwant  %s", got, want)
+	}
+	if strings.Contains(got, "2>") || strings.Contains(got, "--print-logs") || strings.Contains(got, "--auto") {
+		t.Fatal("no stderr redirect or legacy flags")
+	}
+}
+
+func TestResolveAgentCmd(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "myagent")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("RELAY_AGENT_CMD", "myagent --model haiku  --effort low")
+	got, err := resolveAgentCmd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, " ") != bin+" --model haiku --effort low" {
+		t.Fatalf("agent = %v", got)
+	}
+	t.Setenv("RELAY_AGENT_CMD", "")
+	if _, err := resolveAgentCmd(); err == nil {
+		t.Fatal("default claude must not resolve in an empty PATH")
+	}
+	t.Setenv("RELAY_AGENT_CMD", "nosuchagent")
+	if _, err := resolveAgentCmd(); err == nil {
+		t.Fatal("unknown agent must fail")
+	}
+}
+
+func TestWritePendingMarkerIsAtomicJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pending-llm-1-2")
+	m := pendingMarker{Target: "llm-1-2:0.0", SpawnInstant: 5, SessionID: "11111111-2222-4333-8444-555555555555", Resume: true}
+	if err := writePendingMarker(path, m); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back pendingMarker
+	if err := json.Unmarshal(data, &back); err != nil || back != m {
+		t.Fatalf("marker = %+v err=%v", back, err)
+	}
+	entries, _ := os.ReadDir(filepath.Dir(path))
+	if len(entries) != 1 {
+		t.Fatalf("temp files left behind: %v", entries)
+	}
 }

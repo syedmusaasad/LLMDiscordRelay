@@ -1,10 +1,10 @@
-// Package mirror: watcher polls the DB for new sessions and pairs them with pending markers.
+// Package mirror: watcher pairs pending spawn markers with Claude Code
+// transcripts and mirrors them to Discord.
 package mirror
 
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,22 +31,23 @@ type Config struct {
 	ChannelID     string
 	AllowedUserID string // only honour messages from this Discord user ID (DISCORD_USER_ID)
 
-	// DB
-	DBPath string
+	// ProjectsRoot is the Claude Code projects directory holding the session
+	// transcripts (default: transcript.DefaultRoot()).
+	ProjectsRoot string
 
 	// State
 	StateDir string
 
 	// Binaries
-	// DpmuxBin is the path to the dpmux binary (default: "dpmux" on PATH).
+	// LlmuxBin is the path to the llmux binary (default: "llmux" on PATH).
 	// Used when spawning a new session from a Discord channel message.
-	DpmuxBin string
+	LlmuxBin string
 
 	// Timing
 	PollInterval time.Duration // default 1s
 
-	// SpawnBindTimeout is how long to wait for the DB session row after dpmux spawn.
-	// Default 60s.
+	// SpawnBindTimeout is how long to wait for the transcript to appear after
+	// the first prompt of a spawned session was sent. Default 60s.
 	SpawnBindTimeout time.Duration
 
 	// ApprovalTimeout is the maximum time an approval prompt can remain unanswered.
@@ -134,10 +134,10 @@ type ThreadRef struct {
 	ID string
 }
 
-// Watcher polls the DB and mirrors sessions to Discord.
+// Watcher mirrors Claude Code sessions to Discord.
 type Watcher struct {
 	cfg      Config
-	db       *sql.DB
+	store    transcript.Store
 	discord  DiscordClient
 	sessions *Sessions
 	throttle *Throttle
@@ -154,10 +154,16 @@ type Watcher struct {
 	pendingResume pendingResumeStore
 	// suppressedEchoes tracks (sessionID, promptText) pairs whose Discord echo
 	// has already been posted once. A second appearance of the same prompt in
-	// the DB (due to inject retry) must not be posted again.
+	// the transcript (due to inject retry) must not be posted again.
 	suppressedEchoes    suppressedEchoStore
 	pendingInteractions pendingInteractionStore
+	// mirrors holds the cancel func of the live content mirror per session, so a
+	// resumed session's new mirror supersedes the one of its dead pane.
+	mirrorsMu sync.Mutex
+	mirrors   map[string]*mirrorHandle
 }
+
+type mirrorHandle struct{ cancel context.CancelFunc }
 
 // pendingInteractionStore records one outstanding pane interaction per Discord
 // component message. It prevents duplicate clicks and lets the timeout race be
@@ -173,6 +179,7 @@ type pendingInteraction struct {
 	messageID string
 	kind      string
 	options   int
+	result    chan bool // kind "trust": receives the final decision
 }
 
 func (p *pendingInteractionStore) put(id string, entry pendingInteraction) {
@@ -267,8 +274,8 @@ func (c *claimSet) copyInto(dst map[string]bool) {
 	}
 }
 
-// NewWatcher creates a watcher. db must already be open read-only.
-func NewWatcher(cfg Config, db *sql.DB, discord DiscordClient) (*Watcher, error) {
+// NewWatcher creates a watcher.
+func NewWatcher(cfg Config, discord DiscordClient) (*Watcher, error) {
 	if cfg.PollInterval == 0 {
 		cfg.PollInterval = 1 * time.Second
 	}
@@ -281,6 +288,13 @@ func NewWatcher(cfg Config, db *sql.DB, discord DiscordClient) (*Watcher, error)
 	if cfg.SessionTTL == 0 {
 		cfg.SessionTTL = 30 * 24 * time.Hour
 	}
+	if cfg.ProjectsRoot == "" {
+		root, err := transcript.DefaultRoot()
+		if err != nil {
+			return nil, fmt.Errorf("mirror: projects root: %w", err)
+		}
+		cfg.ProjectsRoot = root
+	}
 	sessPath := filepath.Join(cfg.StateDir, "sessions.json")
 	sessions, err := LoadSessions(sessPath)
 	if err != nil {
@@ -288,7 +302,7 @@ func NewWatcher(cfg Config, db *sql.DB, discord DiscordClient) (*Watcher, error)
 	}
 	w := &Watcher{
 		cfg:      cfg,
-		db:       db,
+		store:    transcript.Store{Root: cfg.ProjectsRoot},
 		discord:  discord,
 		sessions: sessions,
 		throttle: NewThrottle(5, 5*time.Second),
@@ -309,8 +323,8 @@ func NewWatcher(cfg Config, db *sql.DB, discord DiscordClient) (*Watcher, error)
 // NewWatcherForTest builds a minimal Watcher around a real DiscordClient
 // (e.g. wrapping the production discord.New() client) for tests that need to
 // exercise the relay's own 429 retry/throttle path (discordSend) without a
-// full DB/tmux/dpmux fixture. It uses an in-memory sessions store and default
-// throttle settings, matching what NewWatcher configures.
+// full transcript/tmux/llmux fixture. It uses an in-memory sessions store and
+// default throttle settings, matching what NewWatcher configures.
 func NewWatcherForTest(discord DiscordClient) (*Watcher, error) {
 	return &Watcher{
 		discord:  discord,
@@ -358,99 +372,41 @@ func (w *Watcher) Run(ctx context.Context) {
 	}
 }
 
-// scanSessions checks for new non-subagent sessions and pairs them with pending markers.
-func (w *Watcher) scanSessions(ctx context.Context, seen map[string]bool) {
-	rows, err := w.db.QueryContext(ctx,
-		`SELECT id, time_created, title FROM session WHERE parent_id IS NULL ORDER BY time_created ASC`)
-	if err != nil {
-		return
-	}
-	defer rows.Close()
-
-	type sessionRow struct {
-		id      string
-		created int64
-		title   string
-	}
-
-	var sessions []sessionRow
-	for rows.Next() {
-		var r sessionRow
-		if err := rows.Scan(&r.id, &r.created, &r.title); err != nil {
-			continue
-		}
-		sessions = append(sessions, r)
-	}
-	_ = rows.Close()
-
-	for _, s := range sessions {
-		if seen[s.id] {
-			continue
-		}
-		// Try to pair with a pending marker
-		target, pendingPath, ok := findPendingMarker(w.cfg.StateDir, s.id, s.created)
-		if !ok {
-			// Unmatched session – ignore per spec
-			continue
-		}
-		// Atomically claim this session to prevent double-binding with handleSpawnFromDiscord.
-		if !w.claimed.tryAdd(s.id) {
-			// Already claimed by the spawn path; mark as seen so we stop trying.
-			seen[s.id] = true
-			continue
-		}
-		seen[s.id] = true
-
-		// Claim this session
-		go func(sessionID, tmuxTarget, pendingPath string, createdAt int64) {
-			defer os.Remove(pendingPath) // clean up marker
-
-			if err := w.mirrorSession(ctx, sessionID, tmuxTarget, createdAt); err != nil {
-				log.Printf("mirror: session %s error: %v", sessionID, err)
-			}
-		}(s.id, target, pendingPath, s.created)
-	}
-}
-
-// spawnMarkerJSON is the JSON format of a pending marker written by dpmux.
-//
-// StderrLog is the phase-16-verified production identity evidence: the exact
-// tmux pane's devpass-code process (launched with --print-logs --log-level
-// INFO) has its stderr redirected exclusively to this file. When it creates a
-// new session row, it logs "message=created id=ses_<ID>" there — a line no
-// other process can write, because the file belongs to this one launch only.
-// See docs/BINDING-PROTOCOL.md.
+// spawnMarkerJSON is the JSON pending marker written by llmux. llmux chooses
+// the Claude Code session id itself (claude --session-id / --resume), so the
+// marker carries the identity directly: nothing has to be inferred from the
+// session store, and a transcript with this exact id can only belong to this
+// launch. See docs/BINDING-PROTOCOL.md.
 type spawnMarkerJSON struct {
 	Target       string `json:"target"`
-	Nonce        string `json:"nonce"` // legacy; not used to prove identity
 	SpawnInstant int64  `json:"spawnInstant"`
-	StderrLog    string `json:"stderrLog"`
-	// SessionID is set only for an exact-id resume.  A resume has no new
-	// session-creation event to log, so its requested historical id is the
-	// identity evidence; it must never be matched to a newly discovered row.
-	SessionID string `json:"sessionID,omitempty"`
+	SessionID    string `json:"sessionID"`
+	// Resume marks a marker for `claude --resume <id>`: the transcript already
+	// exists, and a pane that is not (yet) alive is expected.
+	Resume bool `json:"resume,omitempty"`
 }
 
-// findPendingMarker looks for a pending-<name> marker file in stateDir that
-// can be proven to own sessionID.
-//
-// JSON markers with a StderrLog field are matched using the phase-16-verified
-// production identity protocol: the marker's StderrLog file must contain
-// "message=created id=<sessionID>" (see extractCreatedSessionID), and the
-// session must have been created at or after the marker's spawnInstant.
-// Neither the legacy nonce/title field nor any other heuristic is accepted as
-// proof for these markers; a JSON marker with no StderrLog cannot be matched.
-// Exact-id resume markers bind only their requested historical SessionID. New
-// spawn markers bind only the id in their exclusive stderr log. Plain-text
-// markers retain only the legacy pre-existing-session attachment behavior;
-// they cannot bind a row created after the marker (the unsafe fallback).
-func findPendingMarker(stateDir string, sessionID string, createdAt int64) (target, pendingPath string, ok bool) {
+// staleMarkerAge is how old a marker must be before scanSessions may delete it
+// for being orphaned (dead pane, or session already tracked).
+const staleMarkerAge = 2 * time.Minute
+
+// pendingMarker is a parsed pending-<name> file.
+type pendingMarker struct {
+	path string
+	mod  time.Time
+	spawnMarkerJSON
+}
+
+// readPendingMarkers returns the valid pending markers in stateDir. Markers
+// without a well-formed session id are ignored: there is no heuristic fallback.
+func readPendingMarkers(stateDir string) []pendingMarker {
 	entries, err := os.ReadDir(stateDir)
 	if err != nil {
-		return "", "", false
+		return nil
 	}
+	var out []pendingMarker
 	for _, e := range entries {
-		if !strings.HasPrefix(e.Name(), "pending-") {
+		if !strings.HasPrefix(e.Name(), "pending-") || strings.Contains(e.Name(), ".tmp-") {
 			continue
 		}
 		fp := filepath.Join(stateDir, e.Name())
@@ -458,58 +414,64 @@ func findPendingMarker(stateDir string, sessionID string, createdAt int64) (targ
 		if err != nil {
 			continue
 		}
-
-		// Try parsing as JSON.
 		var m spawnMarkerJSON
-		if jsonErr := json.Unmarshal(data, &m); jsonErr != nil || m.Target == "" {
-			legacyTarget := strings.TrimSpace(string(data))
-			info, infoErr := e.Info()
-			// Compatibility only for sessions that predate a plain marker (the
-			// historic attachment fixture). This deliberately excludes every
-			// post-marker/new-spawn row, so a timestamp is never used to claim a
-			// newly created foreign transcript.
-			if legacyTarget != "" && infoErr == nil && createdAt <= info.ModTime().UnixMilli() && isTmuxPaneAlive(legacyTarget) {
-				return legacyTarget, fp, true
-			}
+		if json.Unmarshal(data, &m) != nil || m.Target == "" || !transcript.ValidSessionID(m.SessionID) {
 			continue
 		}
-		if m.SessionID != "" {
-			// A resumed CLI is invoked with this exact id and does not create a
-			// new row, so timestamps and pane liveness are deliberately irrelevant
-			// here. This preserves a known historical session whose old pane died:
-			// it is attached by exact identity and then resumed, never inferred
-			// from any arbitrary post-spawn row.
-			if m.SessionID == sessionID {
-				// A pending historical session may intentionally point at a
-				// dead pane so the inbound path can resume it. Markers written
-				// by dpmux carry a creation-time StderrLog; ad-hoc legacy
-				// markers do not, so retain their dead-target resume behavior.
-				if m.StderrLog == "" || isTmuxPaneAlive(m.Target) {
-					return m.Target, fp, true
-				}
-			}
-			continue
+		pm := pendingMarker{path: fp, spawnMarkerJSON: m}
+		if info, err := e.Info(); err == nil {
+			pm.mod = info.ModTime()
 		}
-		// Liveness is a constraint on verified new-spawn identity, not a
-		// substitute for it. Check it immediately before returning the marker
-		// for a claim so a pane that died while the DB was polled cannot attach
-		// a foreign row.
-		if !isTmuxPaneAlive(m.Target) {
-			continue
-		}
-		if createdAt < m.SpawnInstant || m.StderrLog == "" {
-			continue
-		}
-		loggedID, logOK := extractCreatedSessionID(m.StderrLog)
-		if logOK && loggedID == sessionID {
-			return m.Target, fp, true
-		}
+		out = append(out, pm)
 	}
-	return "", "", false
+	return out
+}
+
+// scanSessions pairs pending markers with transcripts. A marker whose session
+// id already has a transcript (the first prompt was submitted) is claimed and
+// mirrored; a new-spawn marker additionally needs its pane alive.
+func (w *Watcher) scanSessions(ctx context.Context, seen map[string]bool) {
+	for _, m := range readPendingMarkers(w.cfg.StateDir) {
+		old := !m.mod.IsZero() && time.Since(m.mod) > staleMarkerAge
+		if seen[m.SessionID] {
+			if old {
+				// Tracked via sessions.json but never re-attached: the marker is spent.
+				os.Remove(m.path)
+			}
+			continue
+		}
+		if _, err := w.store.Path(m.SessionID); err != nil {
+			// No first prompt yet. Keep waiting while the pane lives.
+			if old && !m.Resume && !isTmuxPaneAlive(m.Target) {
+				os.Remove(m.path)
+			}
+			continue
+		}
+		if !m.Resume && !isTmuxPaneAlive(m.Target) {
+			if old {
+				os.Remove(m.path)
+			}
+			continue
+		}
+		// Atomically claim this session to prevent double-binding with handleSpawnFromDiscord.
+		if !w.claimed.tryAdd(m.SessionID) {
+			seen[m.SessionID] = true
+			continue
+		}
+		seen[m.SessionID] = true
+
+		go func(sessionID, tmuxTarget, pendingPath string) {
+			defer os.Remove(pendingPath) // clean up marker
+
+			if err := w.mirrorSession(ctx, sessionID, tmuxTarget); err != nil {
+				log.Printf("mirror: session %s error: %v", sessionID, err)
+			}
+		}(m.SessionID, m.Target, m.path)
+	}
 }
 
 // mirrorSession mirrors a single session to Discord.
-func (w *Watcher) mirrorSession(ctx context.Context, sessionID, tmuxTarget string, createdAt int64) error {
+func (w *Watcher) mirrorSession(ctx context.Context, sessionID, tmuxTarget string) error {
 	log.Printf("mirror: attaching session %s target=%s", sessionID, tmuxTarget)
 
 	// Create thread root message
@@ -541,7 +503,11 @@ func (w *Watcher) mirrorSession(ctx context.Context, sessionID, tmuxTarget strin
 	}
 
 	// Mirror the session content
-	if err := w.mirrorContent(ctx, sessionID, threadID, tmuxTarget); err != nil {
+	if err := w.mirrorContent(ctx, sessionID, threadID, tmuxTarget, 0); err != nil {
+		if errors.Is(err, errMirrorSuperseded) {
+			// A resumed pane took over this thread; it is not ending.
+			return nil
+		}
 		log.Printf("mirror: mirrorContent error: %v", err)
 	}
 
@@ -564,17 +530,15 @@ func (w *Watcher) mirrorSession(ctx context.Context, sessionID, tmuxTarget strin
 	return nil
 }
 
-// msgState tracks per-message relay state.
+// errMirrorSuperseded is returned by mirrorContent when a newer mirror for the
+// same session (after a resume) replaced it.
+var errMirrorSuperseded = errors.New("mirror: superseded by a newer mirror")
+
+// msgState tracks the Discord messages that stream one assistant message.id.
 type msgState struct {
-	role          string
 	discordMsgID  string   // current edit-target Discord message ID for assistant text
-	discordMsgIDs []string // all Discord message IDs posted for this assistant text (for softening)
+	discordMsgIDs []string // all Discord message IDs posted for this assistant text
 	text          string   // accumulated text so far
-	toolCalls     map[string]*toolState
-	isPreamble    bool
-	finishSeen    bool
-	promptEchoed  bool
-	hadOutput     bool
 }
 
 // toolState tracks per-tool-call state.
@@ -586,15 +550,48 @@ type toolState struct {
 	failed   bool
 }
 
-// mirrorContent tails the DB and mirrors content to the Discord thread.
-func (w *Watcher) mirrorContent(ctx context.Context, sessionID, threadID, tmuxTarget string) error {
-	tailer := transcript.NewTailer(w.db, sessionID, 250*time.Millisecond)
+// turnState tracks the turn currently being mirrored.
+type turnState struct {
+	open      bool
+	hadOutput bool
+	tools     []*toolState
+}
 
-	// First-sight replay: start from 0 to pick up any existing content
-	ch, err := tailer.Tail(ctx, 0)
-	if err != nil {
-		return err
+// registerMirror makes this mirror the live one for sessionID and cancels any
+// earlier one. The returned func unregisters it if it is still the live one.
+func (w *Watcher) registerMirror(ctx context.Context, sessionID string) (context.Context, func()) {
+	mctx, cancel := context.WithCancel(ctx)
+	h := &mirrorHandle{cancel: cancel}
+	w.mirrorsMu.Lock()
+	if w.mirrors == nil {
+		w.mirrors = make(map[string]*mirrorHandle)
 	}
+	if old := w.mirrors[sessionID]; old != nil {
+		old.cancel()
+	}
+	w.mirrors[sessionID] = h
+	w.mirrorsMu.Unlock()
+	return mctx, func() {
+		w.mirrorsMu.Lock()
+		if w.mirrors[sessionID] == h {
+			delete(w.mirrors, sessionID)
+		}
+		w.mirrorsMu.Unlock()
+		cancel()
+	}
+}
+
+// mirrorContent tails the session transcript and mirrors it to the Discord
+// thread: one Discord message per assistant message.id (edited as blocks
+// arrive), one tool embed per tool_use id, and a summary at the end of a turn.
+// startOffset skips that many bytes of the transcript (0 replays all of it).
+func (w *Watcher) mirrorContent(parent context.Context, sessionID, threadID, tmuxTarget string, startOffset int64) error {
+	ctx, release := w.registerMirror(parent, sessionID)
+	defer release()
+
+	tailer := transcript.NewTailer(w.store, sessionID, 250*time.Millisecond)
+	tailer.StartOffset = startOffset
+	ch := tailer.Tail(ctx)
 
 	// Typing ticker
 	typingTicker := time.NewTicker(8 * time.Second)
@@ -604,15 +601,16 @@ func (w *Watcher) mirrorContent(ctx context.Context, sessionID, threadID, tmuxTa
 	livenessTicker := time.NewTicker(5 * time.Second)
 	defer livenessTicker.Stop()
 
-	// Map from DB message_id → msgState
-	msgs := make(map[string]*msgState)
-	// Track last assistant message ID for turn-no-output detection
-	var lastAsstMsgID string
+	asst := make(map[string]*msgState)   // assistant message.id -> Discord streaming state
+	tools := make(map[string]*toolState) // tool_use id -> embed state
+	var turn turnState
+	seenAsst := make(map[string]bool) // dedupe key: line uuid + block ordinal text
 	// Prompt recognition belongs to the pane, not the transcript: approvals have
-	// no blocking transcript part (TRANSCRIPT-SCHEMA.md §Approval prompt).
-	approvalTicker := time.NewTicker(250 * time.Millisecond)
-	defer approvalTicker.Stop()
+	// no blocking transcript part (docs/TRANSCRIPT-SCHEMA.md).
+	paneTicker := time.NewTicker(250 * time.Millisecond)
+	defer paneTicker.Stop()
 	approvalSignature := ""
+	questionSignature := ""
 
 	sendTyping := func() {
 		if err := w.discord.SendTyping(threadID); err != nil {
@@ -624,6 +622,9 @@ func (w *Watcher) mirrorContent(ctx context.Context, sessionID, threadID, tmuxTa
 	for {
 		select {
 		case <-ctx.Done():
+			if parent.Err() == nil {
+				return errMirrorSuperseded
+			}
 			return ctx.Err()
 
 		case <-typingTicker.C:
@@ -635,7 +636,7 @@ func (w *Watcher) mirrorContent(ctx context.Context, sessionID, threadID, tmuxTa
 				return nil
 			}
 
-		case <-approvalTicker.C:
+		case <-paneTicker.C:
 			if tmuxTarget == "" {
 				continue
 			}
@@ -643,135 +644,140 @@ func (w *Watcher) mirrorContent(ctx context.Context, sessionID, threadID, tmuxTa
 			if captureErr != nil {
 				continue
 			}
-			approvalPosted := w.pendingInteractions.has(threadID, tmuxTarget, "approval")
-			signature := approvalPromptSignature(pane)
-			if isApprovalPrompt(pane) && signature != approvalSignature {
-				approvalPosted = false
+			if inject.IsPermissionPrompt(pane) {
+				signature := inject.PermissionSignature(pane)
+				if signature != approvalSignature && !w.pendingInteractions.has(threadID, tmuxTarget, "approval") {
+					approvalSignature = signature
+					w.postApproval(threadID, tmuxTarget, signature)
+				}
+			} else {
+				approvalSignature = ""
 			}
-			if !approvalPosted && isApprovalPrompt(pane) {
-				approvalPosted = true
-				approvalSignature = signature
-				w.postApproval(threadID, tmuxTarget)
-			}
-			questionPosted := w.pendingInteractions.has(threadID, tmuxTarget, "question")
-			if !questionPosted {
-				if q, ok := parseQuestionPicker(pane); ok {
-					questionPosted = true
+			if q, ok := inject.ParseQuestion(pane); ok {
+				signature := q.Prompt + "\x00" + strings.Join(q.Options, "\x00")
+				if signature != questionSignature && !w.pendingInteractions.has(threadID, tmuxTarget, "question") {
+					questionSignature = signature
 					w.postQuestion(threadID, tmuxTarget, q)
 				}
+			} else {
+				questionSignature = ""
 			}
 
-		case part, ok := <-ch:
+		case ev, ok := <-ch:
 			if !ok {
+				if parent.Err() == nil && ctx.Err() != nil {
+					return errMirrorSuperseded
+				}
 				return nil
 			}
-
-			// Look up or create message state
-			ms, exists := msgs[part.MessageID]
-			if !exists {
-				// Fetch the message role from DB
-				role, isPreamble := w.fetchMessageRole(ctx, part.MessageID)
-				ms = &msgState{
-					role:       role,
-					toolCalls:  make(map[string]*toolState),
-					isPreamble: isPreamble,
-				}
-				msgs[part.MessageID] = ms
-				if role == "assistant" {
-					lastAsstMsgID = part.MessageID
-				}
-			}
-
-			cp := ClassifyPart(part, ms.role, ms.isPreamble)
-
-			switch cp.Kind {
-			case PartKindPreamble:
-				// Skip preamble parts – do NOT count as user prompts
-
-			case PartKindText:
-				if ms.role == "user" && !ms.isPreamble && !ms.promptEchoed {
-					// Echo user prompt (truncated to 300 chars)
-					prompt := cp.Text
-					runes := []rune(prompt)
-					if len(runes) > 300 {
-						prompt = string(runes[:297]) + "..."
-					}
-					if prompt != "" {
-						ms.promptEchoed = true
-						// Suppress duplicate echo: if injectAndVerify already echoed this
-						// prompt (because it had to retry the injection), skip the second
-						// Discord post.  Use the raw cp.Text for the suppression key (before
-						// truncation) so the check is length-invariant.
-						if !w.suppressedEchoes.has(sessionID, cp.Text) {
-							w.sendToThread(threadID, fmt.Sprintf("**You:** %s", prompt))
-						} else {
-							log.Printf("mirror: suppressed duplicate echo for session %s", sessionID)
-						}
-					}
-				} else if ms.role == "assistant" {
-					// Accumulate and stream assistant text
-					ms.text += cp.Text
-					ms.hadOutput = true
-					w.updateTextMessage(threadID, ms)
-				}
-
-			case PartKindToolCall:
-				if ms.role == "assistant" {
-					w.handleToolPart(threadID, cp, ms)
-				}
-
-			case PartKindStepStart:
-				// nothing to mirror
-
-			case PartKindStepFinish:
-				if ms.role == "assistant" {
-					// Flush remaining text
-					if ms.text != "" && ms.discordMsgID == "" {
-						// Text was not yet posted
-						w.sendToThread(threadID, ms.text)
-						ms.text = ""
-					}
-					ms.finishSeen = true
-					// "Turn finished without output"
-					if !ms.hadOutput && lastAsstMsgID == part.MessageID {
-						w.sendToThread(threadID, "_Turn finished without output_")
-					}
-					// Soften any failed tool embeds in-place: flip ❌ failed → ⚠️ warning
-					for _, ts := range ms.toolCalls {
-						if ts.failed && ts.msgID != "" {
-							content := formatToolEmbedSoftened(ts.toolName, ts.callID)
-							w.throttle.Wait(threadID)
-							if err := w.discordEdit(threadID, ts.msgID, content); err != nil {
-								log.Printf("mirror: soften tool embed: %v", err)
-							}
-						}
-					}
-					// Summary line
-					toolCount := len(ms.toolCalls)
-					w.sendToThread(threadID, fmt.Sprintf("_— %d tool(s)_", toolCount))
-				}
-			}
+			w.mirrorEvent(sessionID, threadID, ev, asst, tools, &turn, seenAsst)
 		}
 	}
 }
 
-// fetchMessageRole queries the DB for the role and preamble status of a message.
-func (w *Watcher) fetchMessageRole(ctx context.Context, messageID string) (role string, isPreamble bool) {
-	var data string
-	err := w.db.QueryRowContext(ctx, `SELECT data FROM message WHERE id = ?`, messageID).Scan(&data)
-	if err != nil {
-		return "unknown", false
+// mirrorEvent applies one transcript event to the Discord thread.
+func (w *Watcher) mirrorEvent(sessionID, threadID string, ev transcript.Event,
+	asst map[string]*msgState, tools map[string]*toolState, turn *turnState, seen map[string]bool) {
+	switch ev.Kind {
+	case transcript.KindUserPrompt:
+		*turn = turnState{open: true}
+		prompt := ev.Text
+		runes := []rune(prompt)
+		if len(runes) > 300 {
+			prompt = string(runes[:297]) + "..."
+		}
+		if prompt == "" {
+			return
+		}
+		// Suppress duplicate echo: if injectAndVerify already echoed this
+		// prompt (because it had to retry the injection), skip the second
+		// Discord post.  Use the raw text for the suppression key (before
+		// truncation) so the check is length-invariant.
+		if w.suppressedEchoes.has(sessionID, ev.Text) {
+			log.Printf("mirror: suppressed duplicate echo for session %s", sessionID)
+			return
+		}
+		w.sendToThread(threadID, fmt.Sprintf("**You:** %s", prompt))
+
+	case transcript.KindAssistantText:
+		turn.open = true
+		key := ev.UUID + "\x00" + ev.Text
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		ms := asst[ev.MessageID]
+		if ms == nil {
+			ms = &msgState{}
+			asst[ev.MessageID] = ms
+		}
+		if ms.text != "" {
+			ms.text += "\n\n"
+		}
+		ms.text += ev.Text
+		turn.hadOutput = true
+		w.updateTextMessage(threadID, ms)
+
+	case transcript.KindToolCall:
+		turn.open = true
+		key := ev.ToolID
+		if key == "" {
+			key = ev.ToolName
+		}
+		if tools[key] != nil {
+			return
+		}
+		content := formatToolEmbed(ev.ToolName, ev.ToolID, false, false)
+		w.throttle.Wait(threadID)
+		toolMsg, err := w.discordSend(threadID, content)
+		if err != nil {
+			log.Printf("mirror: tool embed: %v", err)
+			return
+		}
+		ts := &toolState{callID: ev.ToolID, toolName: ev.ToolName, msgID: toolMsg.ID}
+		tools[key] = ts
+		turn.tools = append(turn.tools, ts)
+
+	case transcript.KindToolResult:
+		ts := tools[ev.ToolID]
+		if ts == nil || ts.done || ts.failed {
+			return
+		}
+		if ev.IsError {
+			ts.failed = true
+		} else {
+			ts.done = true
+		}
+		content := formatToolEmbed(ts.toolName, ts.callID, ts.done, ts.failed)
+		w.throttle.Wait(threadID)
+		if err := w.discordEdit(threadID, ts.msgID, content); err != nil {
+			log.Printf("mirror: update tool embed: %v", err)
+		}
+
+	case transcript.KindTurnEnd:
+		if !turn.open {
+			return // e.g. the turn_duration that follows an interrupt
+		}
+		if ev.Interrupted {
+			w.sendToThread(threadID, "_Turn interrupted_")
+		} else {
+			if !turn.hadOutput {
+				w.sendToThread(threadID, "_Turn finished without output_")
+			}
+			// Soften failed tool embeds in-place: the turn completed, so flip
+			// ❌ failed → ⚠️ warning.
+			for _, ts := range turn.tools {
+				if ts.failed && ts.msgID != "" {
+					w.throttle.Wait(threadID)
+					if err := w.discordEdit(threadID, ts.msgID, formatToolEmbedSoftened(ts.toolName, ts.callID)); err != nil {
+						log.Printf("mirror: soften tool embed: %v", err)
+					}
+				}
+			}
+		}
+		w.sendToThread(threadID, fmt.Sprintf("_— %d tool(s)_", len(turn.tools)))
+		*turn = turnState{}
 	}
-	var md struct {
-		Role  string `json:"role"`
-		Agent string `json:"agent,omitempty"`
-	}
-	if err := json.Unmarshal([]byte(data), &md); err != nil {
-		return "unknown", false
-	}
-	// Preamble: user message with agent context (harness-injected)
-	isPreamble = md.Role == "user" && md.Agent != ""
-	return md.Role, isPreamble
 }
 
 // sendToThread sends a message to the thread.
@@ -1008,59 +1014,6 @@ func extractRetryAfter(err error) (time.Duration, bool) {
 	return 0, false
 }
 
-// handleToolPart updates the tool embed for a tool-call part.
-func (w *Watcher) handleToolPart(threadID string, cp ClassifiedPart, ms *msgState) {
-	toolKey := cp.ToolID
-	if toolKey == "" {
-		toolKey = cp.ToolName
-	}
-
-	ts, exists := ms.toolCalls[toolKey]
-	if !exists {
-		// Post tool embed
-		content := formatToolEmbed(cp.ToolName, cp.ToolID, false, false)
-		w.throttle.Wait(threadID)
-		toolMsg, sendErr := w.discordSend(threadID, content)
-		if sendErr != nil {
-			log.Printf("mirror: tool embed: %v", sendErr)
-			return
-		}
-		ts = &toolState{
-			callID:   cp.ToolID,
-			toolName: cp.ToolName,
-			msgID:    toolMsg.ID,
-		}
-		ms.toolCalls[toolKey] = ts
-	}
-
-	// Parse tool state to check completion
-	var raw struct {
-		State struct {
-			Status string `json:"status"`
-		} `json:"state"`
-	}
-	if err := json.Unmarshal(cp.Data, &raw); err != nil {
-		return
-	}
-
-	status := raw.State.Status
-	if status == "completed" && !ts.done {
-		ts.done = true
-		content := formatToolEmbed(ts.toolName, ts.callID, true, false)
-		w.throttle.Wait(threadID)
-		if err := w.discordEdit(threadID, ts.msgID, content); err != nil {
-			log.Printf("mirror: update tool embed done: %v", err)
-		}
-	} else if status == "error" && !ts.failed {
-		ts.failed = true
-		content := formatToolEmbed(ts.toolName, ts.callID, false, true)
-		w.throttle.Wait(threadID)
-		if err := w.discordEdit(threadID, ts.msgID, content); err != nil {
-			log.Printf("mirror: update tool embed error: %v", err)
-		}
-	}
-}
-
 // formatToolEmbed formats a tool call as a Discord message.
 func formatToolEmbed(toolName, callID string, done, failed bool) string {
 	status := "⏳ running"
@@ -1074,21 +1027,9 @@ func formatToolEmbed(toolName, callID string, done, failed bool) string {
 }
 
 // formatToolEmbedSoftened formats a previously-failed tool embed as a warning
-// (used when step-finish arrives clean, softening the error in-place).
+// (used when the turn completes cleanly, softening the error in-place).
 func formatToolEmbedSoftened(toolName, callID string) string {
 	return fmt.Sprintf("🔧 **Tool:** `%s` | ⚠️ warning | ID: `%s` | turn completed", toolName, callID)
-}
-
-// isTmuxPaneAlive checks if a tmux pane target is still alive.
-// Uses list-panes -t <target> (window-level check) rather than has-session,
-// so a dead pane inside a live session is correctly detected.
-func isTmuxPaneAlive(target string) bool {
-	tmuxBin, err := tmuxctl.ResolveTmuxBin()
-	if err != nil {
-		return false
-	}
-	err = exec.Command(tmuxBin, "list-panes", "-t", target).Run()
-	return err == nil
 }
 
 func capturePaneText(target string) (string, error) {
@@ -1103,70 +1044,30 @@ func capturePaneText(target string) (string, error) {
 	return string(out), nil
 }
 
-// isApprovalPrompt matches the stable visible heading documented in
-// TRANSCRIPT-SCHEMA.md §Approval prompt. Do not infer it from transcript rows:
-// pending permissions are represented only by the pane.
-func isApprovalPrompt(pane string) bool {
-	return strings.Contains(pane, "Permission required") &&
-		strings.Contains(pane, "Allow once") &&
-		strings.Contains(pane, "Reject")
-}
-
-func approvalPromptSignature(pane string) string {
-	last := ""
-	for _, line := range strings.Split(pane, "\n") {
-		if strings.Contains(line, "Permission required") {
-			last = strings.TrimSpace(line)
-		}
+// isTmuxPaneAlive checks if a tmux pane target is still alive.
+// Uses list-panes -t <target> (window-level check) rather than has-session,
+// so a dead pane inside a live session is correctly detected.
+func isTmuxPaneAlive(target string) bool {
+	tmuxBin, err := tmuxctl.ResolveTmuxBin()
+	if err != nil {
+		return false
 	}
-	return last
+	err = exec.Command(tmuxBin, "list-panes", "-t", target).Run()
+	return err == nil
 }
 
-type questionPicker struct {
-	prompt  string
-	options []string
-}
-
-// parseQuestionPicker accepts the fake CLI's deliberately simple picker format:
-//
-//	? Question text
-//	> apple
-//	  pear
-//	enter to confirm
-//
-// The real v1.18.11 CLI exposes no picker (TRANSCRIPT-SCHEMA.md §Question
-// picker), so this parser and its recipe are unverified against the real TUI.
-func parseQuestionPicker(pane string) (questionPicker, bool) {
-	lines := strings.Split(pane, "\n")
-	for i, raw := range lines {
-		line := strings.TrimSpace(raw)
-		if !strings.HasPrefix(line, "? ") {
-			continue
-		}
-		q := questionPicker{prompt: strings.TrimSpace(strings.TrimPrefix(line, "? "))}
-		for _, optionLine := range lines[i+1:] {
-			trimmed := strings.TrimSpace(optionLine)
-			if strings.EqualFold(trimmed, "enter to confirm") {
-				break
-			}
-			if strings.HasPrefix(trimmed, "> ") || strings.HasPrefix(optionLine, "  ") {
-				value := strings.TrimSpace(strings.TrimLeft(trimmed, ">"))
-				if value != "" {
-					q.options = append(q.options, value)
-				}
-			}
-		}
-		if q.prompt != "" && len(q.options) > 0 {
-			return q, true
-		}
-	}
-	return questionPicker{}, false
-}
-
-func (w *Watcher) postApproval(threadID, target string) {
+func (w *Watcher) postApproval(threadID, target, signature string) {
 	approveID := fmt.Sprintf("approval:approve:%d", time.Now().UnixNano())
 	denyID := fmt.Sprintf("approval:deny:%d", time.Now().UnixNano())
-	msg, err := w.discordSendComponents(threadID, "⚠️ **Permission required**\nApprove this devpass-code action?", []Component{
+	content := "⚠️ **Permission required**\nApprove this Claude Code action?"
+	if signature != "" {
+		detail := signature
+		if r := []rune(detail); len(r) > 1200 {
+			detail = string(r[:1200]) + "…"
+		}
+		content += "\n```\n" + strings.ReplaceAll(detail, "```", "'''") + "\n```"
+	}
+	msg, err := w.discordSendComponents(threadID, content, []Component{
 		{Type: "button", CustomID: approveID, Label: "Approve", Style: "success"},
 		{Type: "button", CustomID: denyID, Label: "Deny", Style: "danger"},
 	})
@@ -1199,20 +1100,71 @@ func (w *Watcher) postApproval(threadID, target string) {
 	}()
 }
 
-func (w *Watcher) postQuestion(threadID, target string, q questionPicker) {
+func (w *Watcher) postQuestion(threadID, target string, q inject.Question) {
 	id := fmt.Sprintf("question:select:%d", time.Now().UnixNano())
-	options := make([]ComponentOption, 0, len(q.options))
-	for i, option := range q.options {
+	options := make([]ComponentOption, 0, len(q.Options))
+	for i, option := range q.Options {
 		options = append(options, ComponentOption{Label: option, Value: fmt.Sprintf("%d", i)})
 	}
-	msg, err := w.discordSendComponents(threadID, "❓ **Question:** "+q.prompt, []Component{{
+	msg, err := w.discordSendComponents(threadID, "❓ **Question:** "+q.Prompt, []Component{{
 		Type: "select", CustomID: id, Placeholder: "Choose an answer", Options: options,
 	}})
 	if err != nil {
 		log.Printf("mirror: post question picker: %v", err)
 		return
 	}
-	w.pendingInteractions.put(id, pendingInteraction{target: target, threadID: threadID, messageID: msg.ID, kind: "question", options: len(q.options)})
+	w.pendingInteractions.put(id, pendingInteraction{target: target, threadID: threadID, messageID: msg.ID, kind: "question", options: len(q.Options)})
+}
+
+// askTrust surfaces Claude Code's folder-trust dialog to Discord as an approval
+// posted in channelID and blocks until it is answered. Approve trusts the
+// folder; Deny, a timeout or a shutdown dismisses the dialog (Esc). The relay
+// never trusts a folder on its own.
+func (w *Watcher) askTrust(ctx context.Context, target, channelID string) bool {
+	stamp := time.Now().UnixNano()
+	approveID := fmt.Sprintf("trust:approve:%d", stamp)
+	denyID := fmt.Sprintf("trust:deny:%d", stamp)
+	msg, err := w.discordSendComponents(channelID,
+		"🔐 **Trust this folder?**\nClaude Code is asking whether you trust the folder it was started in (`"+target+"`). Approve to trust it and continue; Deny cancels this session.",
+		[]Component{
+			{Type: "button", CustomID: approveID, Label: "Approve", Style: "success"},
+			{Type: "button", CustomID: denyID, Label: "Deny", Style: "danger"},
+		})
+	if err != nil {
+		log.Printf("mirror: post trust approval: %v", err)
+		_ = tmuxctl.SendRecipe(target, tmuxctl.TrustDenyRecipe)
+		return false
+	}
+	result := make(chan bool, 1)
+	entry := pendingInteraction{target: target, threadID: channelID, messageID: msg.ID, kind: "trust", result: result}
+	w.pendingInteractions.put(approveID, entry)
+	w.pendingInteractions.put(denyID, entry)
+
+	timeout := time.NewTimer(w.cfg.ApprovalTimeout)
+	defer timeout.Stop()
+	deny := func(note string) bool {
+		if err := tmuxctl.SendRecipe(target, tmuxctl.TrustDenyRecipe); err != nil {
+			log.Printf("mirror: trust deny: %v", err)
+		}
+		if err := w.discordEditComponents(channelID, msg.ID, note, nil); err != nil {
+			log.Printf("mirror: edit trust approval: %v", err)
+		}
+		return false
+	}
+	select {
+	case ok := <-result:
+		return ok
+	case <-timeout.C:
+		if _, ok := w.pendingInteractions.take(approveID); !ok {
+			return <-result // an interaction won the race
+		}
+		w.pendingInteractions.take(denyID)
+		return deny("⛔ **Trust denied automatically** (approval timeout).")
+	case <-ctx.Done():
+		w.pendingInteractions.take(approveID)
+		w.pendingInteractions.take(denyID)
+		return deny("⛔ **Trust request cancelled.**")
+	}
 }
 
 func (w *Watcher) handleInteraction(ev InteractionEvent) {
@@ -1227,6 +1179,23 @@ func (w *Watcher) handleInteraction(ev InteractionEvent) {
 		return
 	}
 	switch entry.kind {
+	case "trust":
+		approve := strings.Contains(ev.CustomID, ":approve:")
+		other := strings.Replace(ev.CustomID, ":deny:", ":approve:", 1)
+		if approve {
+			other = strings.Replace(ev.CustomID, ":approve:", ":deny:", 1)
+		}
+		w.pendingInteractions.take(other)
+		recipe, note := tmuxctl.TrustDenyRecipe, "⛔ **Trust denied.**"
+		if approve {
+			recipe, note = tmuxctl.TrustAcceptRecipe, "✅ **Folder trusted.**"
+		}
+		if err := tmuxctl.SendRecipe(entry.target, recipe); err != nil {
+			log.Printf("mirror: trust recipe: %v", err)
+			approve = false
+		}
+		_ = w.discordEditComponents(entry.threadID, entry.messageID, note, nil)
+		entry.result <- approve
 	case "approval":
 		if strings.Contains(ev.CustomID, ":approve:") {
 			if err := tmuxctl.SendRecipe(entry.target, tmuxctl.ApprovalApproveRecipe); err != nil {
@@ -1272,7 +1241,7 @@ func (w *Watcher) handleDiscordMessage(ev MessageEvent) {
 	// even if we somehow also manage a thread with the same ID (impossible in practice,
 	// but correctness requires the channel-message path to be checked first).
 	if ev.ChannelID == w.cfg.ChannelID {
-		log.Printf("mirror: channel message received – spawning new dpmux session")
+		log.Printf("mirror: channel message received – spawning new llmux session")
 		go func(content string, atts []MessageAttachment) {
 			// Use a background context so the spawn survives past handleDiscordMessage.
 			if err := w.handleSpawnFromDiscord(context.Background(), content, atts); err != nil {
@@ -1357,7 +1326,7 @@ func (w *Watcher) handleDiscordMessage(ev MessageEvent) {
 
 // ── Resume dead sessions ───────────────────────────────────────────────────────
 
-// echoVerifyTimeout is how long to wait for the injected prompt to appear in the DB.
+// echoVerifyTimeout is how long to wait for the injected prompt to appear in the transcript.
 const echoVerifyTimeout = 30 * time.Second
 
 // pendingResumeStore tracks pending !resume <n> candidate lists per Discord thread.
@@ -1374,9 +1343,10 @@ type pendingResumeEntry struct {
 }
 
 type resumeCandidate struct {
-	SessionID  string
-	ProviderID string // model provider info if available
-	LastActive int64  // time_updated from DB (ms)
+	SessionID string
+	Title     string
+	Model     string
+	Updated   time.Time
 }
 
 func (p *pendingResumeStore) init() {
@@ -1407,9 +1377,9 @@ func (p *pendingResumeStore) delete(threadID string) {
 
 // teardownSpawnedSession kills exactly one tmux session, addressed by its exact
 // name ("=" disables tmux's prefix/fuzzy matching), so a failed spawn can never
-// take down another session's pane. Only relay-spawned "dp-" names are accepted.
+// take down another session's pane. Only relay-spawned "llm-" names are accepted.
 func teardownSpawnedSession(sessionName string) {
-	if !strings.HasPrefix(sessionName, "dp-") || strings.ContainsAny(sessionName, ":.") {
+	if !strings.HasPrefix(sessionName, "llm-") || strings.ContainsAny(sessionName, ":.") {
 		log.Printf("mirror: refusing to tear down unexpected session name %q", sessionName)
 		return
 	}
@@ -1472,45 +1442,31 @@ func teardownPaneTarget(tmuxTarget string) {
 
 // resumeDeadSession is called when a thread reply arrives for a session whose
 // tmux pane is no longer alive. It:
-//  1. Spawns dpmux with --session <sessionID>.
-//  2. Detects refusal via pane text or session id mismatch.
+//  1. Spawns llmux --resume <sessionID>.
+//  2. Detects refusal: the pane shows "No conversation found with session ID"
+//     or dies before it is ready.
 //  3. On refusal: teardown, retry once silently.
 //  4. On second failure: announces a fresh session was started.
-//  5. On success: updates rec.TmuxTarget and injects the queued message.
+//  5. On success: updates rec.TmuxTarget, re-attaches the transcript mirror and
+//     injects the queued message.
 func (w *Watcher) resumeDeadSession(ctx context.Context, rec *SessionRecord, content string, atts []inject.Attachment) error {
 	log.Printf("mirror: resumeDeadSession: session=%s", rec.SessionID)
 
-	// Take DB baseline BEFORE spawning so any new session row created during
-	// spawn is visible to detectRefusal (never miss a foreign-id creation).
-	baselineMS := time.Now().UnixMilli()
-
-	newTarget, err := w.spawnResume(ctx, rec.SessionID)
+	newTarget, refused, err := w.spawnResumeReady(ctx, rec)
 	if err != nil {
-		return fmt.Errorf("spawn resume: %w", err)
+		return err
 	}
-
-	// Detect refusal: check pane for "Error: Session not found:" within 5s,
-	// or check if a new session row with a foreign id was created since baseline.
-	refused, err := w.detectRefusal(ctx, rec.SessionID, newTarget, baselineMS)
-	if err != nil {
-		log.Printf("mirror: refusal detection error: %v", err)
-	}
-
 	if refused {
 		log.Printf("mirror: resume refused for session %s (attempt 1), tearing down and retrying", rec.SessionID)
 		w.teardownPane(newTarget)
 
-		// Retry once silently — take a fresh baseline before the second spawn.
-		baseline2MS := time.Now().UnixMilli()
-		newTarget2, err2 := w.spawnResume(ctx, rec.SessionID)
-		if err2 != nil {
-			// Could not even spawn. Fall back to fresh session.
-			return w.startFreshSessionAfterRefusal(ctx, rec, content, atts)
-		}
-		refused2, _ := w.detectRefusal(ctx, rec.SessionID, newTarget2, baseline2MS)
-		if refused2 {
-			log.Printf("mirror: resume refused for session %s (attempt 2), starting fresh session", rec.SessionID)
-			w.teardownPane(newTarget2)
+		// Retry once silently.
+		newTarget2, refused2, err2 := w.spawnResumeReady(ctx, rec)
+		if err2 != nil || refused2 {
+			if refused2 {
+				log.Printf("mirror: resume refused for session %s (attempt 2), starting fresh session", rec.SessionID)
+				w.teardownPane(newTarget2)
+			}
 			return w.startFreshSessionAfterRefusal(ctx, rec, content, atts)
 		}
 		newTarget = newTarget2
@@ -1522,185 +1478,193 @@ func (w *Watcher) resumeDeadSession(ctx context.Context, rec *SessionRecord, con
 		log.Printf("mirror: update sessions.json after resume: %v", err)
 	}
 
+	// Re-attach the mirror to the same thread, following only new activity. This
+	// supersedes the mirror of the dead pane if it has not noticed the death yet.
+	offset := w.store.Size(rec.SessionID)
+	go func(sid, threadID, target string) {
+		if err := w.mirrorContent(w.runCtx, sid, threadID, target, offset); err != nil && !errors.Is(err, errMirrorSuperseded) {
+			log.Printf("mirror: resumed mirror %s: %v", sid, err)
+		}
+	}(rec.SessionID, rec.ThreadID, newTarget)
+
 	// Inject the queued message into the resumed session.
 	return w.injectAndVerify(ctx, newTarget, rec.SessionID, rec.ThreadID, content, atts)
 }
 
-// spawnResume launches dpmux with --session <sessionID> and returns the new tmux target.
-func (w *Watcher) spawnResume(ctx context.Context, sessionID string) (string, error) {
-	dpmuxBin := w.cfg.DpmuxBin
-	if dpmuxBin == "" {
-		p, err := exec.LookPath("dpmux")
-		if err != nil {
-			return "", fmt.Errorf("dpmux not found: %w", err)
-		}
-		dpmuxBin = p
+// spawnResumeReady launches the resume and waits for the pane. refused reports
+// the two refusal signals; any other failure to become ready is an error (the
+// pane is torn down).
+func (w *Watcher) spawnResumeReady(ctx context.Context, rec *SessionRecord) (target string, refused bool, err error) {
+	target, err = w.spawnResume(ctx, rec.SessionID)
+	if err != nil {
+		return "", false, fmt.Errorf("spawn resume: %w", err)
 	}
+	readyErr := w.awaitReady(ctx, target, rec.ThreadID)
+	switch {
+	case readyErr == nil:
+		return target, false, nil
+	case errors.Is(readyErr, errPaneRefused):
+		log.Printf("mirror: refusal detected for %s: %v", rec.SessionID, readyErr)
+		return target, true, nil
+	default:
+		w.teardownPane(target)
+		return "", false, fmt.Errorf("resume %s: %w", rec.SessionID, readyErr)
+	}
+}
 
-	cmd := exec.CommandContext(ctx, dpmuxBin, "--session", sessionID)
+// llmuxPath resolves the llmux binary.
+func (w *Watcher) llmuxPath() (string, error) {
+	if w.cfg.LlmuxBin != "" {
+		return w.cfg.LlmuxBin, nil
+	}
+	p, err := exec.LookPath("llmux")
+	if err != nil {
+		return "", fmt.Errorf("llmux not found on PATH (set LlmuxBin in Config): %w", err)
+	}
+	return p, nil
+}
+
+// llmuxEnv builds the environment for an llmux invocation.
+func (w *Watcher) llmuxEnv() []string {
 	env := os.Environ()
 	if w.cfg.StateDir != "" {
 		env = setEnvVar(env, "RELAY_STATE_DIR", w.cfg.StateDir)
 	}
-	if w.cfg.DBPath != "" {
-		env = setEnvVar(env, "RELAY_DEVPASS_DB", w.cfg.DBPath)
+	if w.cfg.ProjectsRoot != "" {
+		env = setEnvVar(env, "RELAY_CLAUDE_PROJECTS", w.cfg.ProjectsRoot)
 	}
-	if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" {
-		env = setEnvVar(env, "XDG_DATA_HOME", xdg)
-	}
-	env = setEnvVar(env, "TMUX", "")
-	cmd.Env = env
+	// Unset TMUX so llmux always creates a fresh tmux session (never new-window
+	// in the relay's own session if the relay runs inside tmux).
+	return setEnvVar(env, "TMUX", "")
+}
 
+// runLlmux runs llmux with args and returns the session name it prints, plus
+// the parsed pending marker.
+func (w *Watcher) runLlmux(ctx context.Context, args ...string) (sessionName string, marker spawnMarkerJSON, pendingPath string, err error) {
+	llmuxBin, err := w.llmuxPath()
+	if err != nil {
+		return "", marker, "", err
+	}
+	cmd := exec.CommandContext(ctx, llmuxBin, args...)
+	cmd.Env = w.llmuxEnv()
 	var stdoutBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = os.Stderr
-
-	log.Printf("mirror: spawnResume: dpmux --session %s", sessionID)
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("dpmux --session %s: %w", sessionID, err)
+		return "", marker, "", fmt.Errorf("llmux %s: %w", strings.Join(args, " "), err)
 	}
-
-	// dpmux prints the session name to stdout.
-	sessionName := strings.TrimSpace(stdoutBuf.String())
+	// llmux prints the session name (llm-<unixtime>-<pid>) to stdout.
+	sessionName = strings.TrimSpace(stdoutBuf.String())
 	if sessionName == "" {
-		return "", fmt.Errorf("dpmux produced no session name")
+		return "", marker, "", fmt.Errorf("llmux produced no session name on stdout")
 	}
-
-	// Read the pending marker to get the tmux target.
-	pendingPath := filepath.Join(w.cfg.StateDir, "pending-"+sessionName)
+	pendingPath = filepath.Join(w.cfg.StateDir, "pending-"+sessionName)
 	data, err := os.ReadFile(pendingPath)
 	if err != nil {
-		// Marker may already be consumed; derive target from session name.
-		return sessionName + ":0.0", nil
+		return sessionName, marker, pendingPath, fmt.Errorf("read pending marker for %q: %w", sessionName, err)
 	}
-	// Try parsing as JSON (nonce-bearing marker).
-	var m spawnMarkerJSON
-	if jsonErr := json.Unmarshal(data, &m); jsonErr == nil && m.Target != "" {
-		return m.Target, nil
+	if err := json.Unmarshal(data, &marker); err != nil || marker.Target == "" {
+		return sessionName, marker, pendingPath, fmt.Errorf("pending marker for %q is not valid", sessionName)
 	}
-	// Legacy plain-text marker.
-	return strings.TrimSpace(string(data)), nil
+	return sessionName, marker, pendingPath, nil
 }
 
-// DetectRefusal is the exported variant of detectRefusal used in tests.
-func (w *Watcher) DetectRefusal(ctx context.Context, sessionID, tmuxTarget string, baselineMS int64) (bool, error) {
-	return w.detectRefusal(ctx, sessionID, tmuxTarget, baselineMS)
+// spawnResume launches llmux --resume <sessionID> and returns the new tmux target.
+func (w *Watcher) spawnResume(ctx context.Context, sessionID string) (string, error) {
+	if !transcript.ValidSessionID(sessionID) {
+		return "", fmt.Errorf("refusing to resume malformed session id %q", sessionID)
+	}
+	log.Printf("mirror: spawnResume: llmux --resume %s", sessionID)
+	sessionName, marker, pendingPath, err := w.runLlmux(ctx, "--resume", sessionID)
+	if err != nil {
+		if sessionName != "" {
+			return sessionName + ":0.0", nil // marker unreadable; fall back to the default target
+		}
+		return "", err
+	}
+	// The relay already tracks this session; the marker has served its purpose.
+	os.Remove(pendingPath)
+	return marker.Target, nil
 }
 
-// detectRefusal returns true if the devpass-code process refused the --session resume.
-// baselineMS is the Unix-millisecond timestamp taken BEFORE spawnResume was called;
-// any new session row with time_created >= baselineMS and an id other than sessionID
-// is evidence of refusal.
-// Signals checked (per DISCOVERY.md):
-//  1. Pane contains "Error: Session not found:" within 5s.
-//  2. The first new session row created after baseline has an id other than sessionID.
-//  3. Pane shows "Ask anything..." (success).
-func (w *Watcher) detectRefusal(ctx context.Context, sessionID, tmuxTarget string, baselineMS int64) (bool, error) {
-	deadline := time.Now().Add(5 * time.Second)
+var (
+	// errPaneRefused: the pane showed "No conversation found with session ID",
+	// or died before it was ready.
+	errPaneRefused = errors.New("pane refused or died before ready")
+	errNotReady    = errors.New("pane did not become ready")
+	errTrustDenied = errors.New("folder trust was not granted")
+)
 
-	// sawAlive tracks whether capturePaneTextRaw has ever succeeded for this
-	// target. This is required to fail closed correctly: a target that never
-	// becomes observable (e.g. its tmux session/server already exited because
-	// the launched process refused and the wrapping shell's tail exited,
-	// tearing down the only session on an isolated socket via tmux's
-	// exit-empty behaviour) must NOT be silently treated as a successful
-	// resume just because the poll loop ran out of time without seeing an
-	// explicit signal. Without this, a fast pane teardown races the poll
-	// loop: every capture-pane call fails with "no server running", no DB
-	// row appears (correctly, since the resume was refused), and the old
-	// code fell through to "assume success" — handing resumeDeadSession a
-	// target that no longer exists, which then fails much later with a
-	// bare "no server running" from send-keys instead of retrying.
+// awaitReady polls the pane until Claude Code accepts a prompt. A folder-trust
+// dialog is surfaced to Discord (notifyChannel) and waited on without counting
+// against the readiness timeout. Refusal and a pane that disappears before it
+// is ready both return errPaneRefused.
+func (w *Watcher) awaitReady(ctx context.Context, target, notifyChannel string) error {
+	deadline := time.Now().Add(inject.ReadyTimeout)
+	captureErrs := 0
 	sawAlive := false
-
-	for time.Now().Before(deadline) {
-		// Signal 1: pane text.
-		if text, err := capturePaneTextRaw(tmuxTarget); err == nil {
+	trustAnswered := false
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		pane, err := capturePaneText(target)
+		if err == nil {
 			sawAlive = true
-			if strings.Contains(text, "Error: Session not found:") {
-				log.Printf("mirror: refusal detected via pane text for %s", sessionID)
-				return true, nil
-			}
-			// Signal 3: if pane shows "Ask anything..." it resumed successfully —
-			// but only accept if no foreign session row exists since baseline.
-			if strings.Contains(text, "Ask anything...") {
-				// Still check for foreign-id (defence-in-depth).
-				var newID string
-				w.db.QueryRowContext(ctx,
-					`SELECT id FROM session WHERE time_created >= ? AND parent_id IS NULL ORDER BY time_created ASC LIMIT 1`,
-					baselineMS,
-				).Scan(&newID)
-				if newID != "" && newID != sessionID {
-					log.Printf("mirror: refusal detected via session id mismatch (ready pane): want=%s got=%s", sessionID, newID)
-					return true, nil
+			captureErrs = 0
+			switch {
+			case inject.IsResumeRefused(pane):
+				return fmt.Errorf("%w: %s", errPaneRefused, inject.ResumeRefusedSignature)
+			case inject.IsTrustDialog(pane):
+				// Ask once. After an approval the dialog can still be on screen
+				// for a frame or two; keep waiting for it to go away.
+				if !trustAnswered {
+					if !w.askTrust(ctx, target, notifyChannel) {
+						return errTrustDenied
+					}
+					trustAnswered = true
+					deadline = time.Now().Add(inject.ReadyTimeout)
 				}
-				return false, nil
+			case inject.PaneReady(pane):
+				return nil
 			}
-		} else if sawAlive {
-			// The pane WAS observable and is now gone without ever showing the
-			// ready signature. A process that disappears before becoming ready
-			// never successfully resumed; treat this as a refusal so the
-			// caller retries/tears down instead of proceeding to inject into a
-			// target that no longer exists.
-			log.Printf("mirror: refusal detected via pane disappearance before ready for %s (target=%s)", sessionID, tmuxTarget)
-			return true, nil
+		} else if captureErrs++; captureErrs >= 5 {
+			// Observed and then gone, or never observable at all: the process
+			// exited (the real CLI exits 1 on a refused resume) before it was
+			// ready. Fail closed.
+			if sawAlive {
+				return fmt.Errorf("%w: pane disappeared before ready", errPaneRefused)
+			}
+			return fmt.Errorf("%w: pane never observable", errPaneRefused)
 		}
-
-		// Signal 2: new session row with wrong id.
-		var newID string
-		w.db.QueryRowContext(ctx,
-			`SELECT id FROM session WHERE time_created >= ? AND parent_id IS NULL ORDER BY time_created ASC LIMIT 1`,
-			baselineMS,
-		).Scan(&newID)
-		if newID != "" && newID != sessionID {
-			log.Printf("mirror: refusal detected via session id mismatch: want=%s got=%s", sessionID, newID)
-			return true, nil
+		if time.Now().After(deadline) {
+			return errNotReady
 		}
-
 		time.Sleep(200 * time.Millisecond)
 	}
-	if !sawAlive {
-		// Never once observed the target within the wait window at all. This
-		// is a failure signal, not a silent success: fail closed by treating
-		// it as a refusal so the caller tears down (a no-op, since nothing
-		// exists) and retries with a fresh spawn, rather than handing back a
-		// target that was never confirmed alive.
-		log.Printf("mirror: refusal detection could never observe target %s for %s – treating as refused", tmuxTarget, sessionID)
-		return true, nil
-	}
-	// Timeout without a definitive signal, but the target was observably
-	// alive throughout – assume success (unchanged prior behaviour).
-	return false, nil
 }
 
-// capturePaneTextRaw captures visible text from a tmux pane target.
-func capturePaneTextRaw(target string) (string, error) {
-	tmuxBin, err := tmuxctl.ResolveTmuxBin()
-	if err != nil {
-		return "", err
-	}
-	out, err := exec.Command(tmuxBin, "capture-pane", "-t", target, "-p").Output()
-	if err != nil {
-		return "", err
-	}
-	return string(out), nil
-}
-
-// startFreshSessionAfterRefusal starts a brand-new session (no --session flag)
+// startFreshSessionAfterRefusal starts a brand-new session (no --resume)
 // and posts ONE notice to the thread that a fresh session was started.
 func (w *Watcher) startFreshSessionAfterRefusal(ctx context.Context, rec *SessionRecord, content string, atts []inject.Attachment) error {
 	log.Printf("mirror: starting fresh session after double refusal for %s", rec.SessionID)
 	w.sendToThread(rec.ThreadID, "⚠️ Could not resume previous session; a **fresh session** has been started.")
 
-	// Spawn a fresh dpmux session (no --session).
-	if err := w.handleSpawnFromDiscord(ctx, content, nil); err != nil {
+	// Spawn a fresh llmux session (no --resume).
+	var msgAtts []MessageAttachment
+	for _, a := range atts {
+		msgAtts = append(msgAtts, MessageAttachment{Filename: a.Filename, URL: a.URL})
+	}
+	if err := w.handleSpawnFromDiscord(ctx, content, msgAtts); err != nil {
 		return fmt.Errorf("fresh spawn after refusal: %w", err)
 	}
 	return nil
 }
 
 // injectAndVerify injects content into the tmux pane and verifies the echo
-// appears in the DB within echoVerifyTimeout. If the echo is absent, it
+// appears in the transcript within echoVerifyTimeout. If the echo is absent, it
 // re-sends once and suppresses duplicate echoes in the Discord thread.
 func (w *Watcher) injectAndVerify(ctx context.Context, target, sessionID, threadID, content string, atts []inject.Attachment) error {
 	// Perform the injection.
@@ -1708,44 +1672,33 @@ func (w *Watcher) injectAndVerify(ctx context.Context, target, sessionID, thread
 		return fmt.Errorf("inject: %w", err)
 	}
 
-	// Verify the echo appears in the DB within echoVerifyTimeout.
+	// Verify the echo appears in the transcript within echoVerifyTimeout.
 	if w.waitForEcho(ctx, sessionID, content, echoVerifyTimeout) {
-		// Echo confirmed — record as echoed so mirrorContent won't double-post.
-		// (The first inject already triggered the "You: …" post in mirrorContent;
-		//  this is a no-op if mirrorContent hasn't seen the row yet.)
+		// Echo confirmed — mirrorContent posts the "You: …" line itself.
 		return nil
 	}
 
 	// Echo absent: re-send once.
 	log.Printf("mirror: echo absent for session %s – re-sending once", sessionID)
 	// Mark the prompt as already-echoed BEFORE the retry so mirrorContent suppresses
-	// the second user-prompt row if the fake echoes both turns.
+	// the second user-prompt event if the prompt is recorded twice.
 	w.suppressedEchoes.add(sessionID, content)
 	if err := w.injector.Inject(target, sessionID, content, atts); err != nil {
 		return fmt.Errorf("inject retry: %w", err)
 	}
-
-	// Suppress duplicate: the Discord echo for this prompt was already posted (or
-	// will be posted) by mirrorContent for the first user-prompt row. Any second
-	// user-prompt row with identical text must not be re-posted to the thread.
-	// The suppressedEchoes entry ensures mirrorContent skips the duplicate.
 	return nil
 }
 
-// waitForEcho polls the DB for the given content in the part table for the
-// specified session, returning true if found within timeout.
+// waitForEcho polls the transcript for the given content as a user prompt of
+// the session, returning true if found within timeout.
 func (w *Watcher) waitForEcho(ctx context.Context, sessionID, content string, timeout time.Duration) bool {
 	if content == "" {
 		return true
 	}
-	// Truncate very long content for the DB LIKE query.
 	needle := content
-	if len(needle) > 100 {
-		needle = needle[:100]
+	if r := []rune(needle); len(r) > 100 {
+		needle = string(r[:100])
 	}
-	needle = strings.ReplaceAll(needle, "%", "\\%")
-	needle = strings.ReplaceAll(needle, "_", "\\_")
-
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		select {
@@ -1753,12 +1706,7 @@ func (w *Watcher) waitForEcho(ctx context.Context, sessionID, content string, ti
 			return false
 		default:
 		}
-		var count int
-		w.db.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM part WHERE session_id = ? AND data LIKE ?`,
-			sessionID, "%"+needle+"%",
-		).Scan(&count)
-		if count > 0 {
+		if w.store.HasPrompt(sessionID, needle) {
 			return true
 		}
 		time.Sleep(300 * time.Millisecond)
@@ -1769,24 +1717,10 @@ func (w *Watcher) waitForEcho(ctx context.Context, sessionID, content string, ti
 // handleAmbiguousResume posts a numbered candidate list of all known sessions
 // so the user can pick one with `!resume <n>`.
 func (w *Watcher) handleAmbiguousResume(rec *SessionRecord, content string, atts []inject.Attachment) {
-	// Collect all known sessions from the DB, newest first.
 	ctx := context.Background()
-	rows, err := w.db.QueryContext(ctx,
-		`SELECT id, time_updated FROM session WHERE parent_id IS NULL ORDER BY time_updated DESC LIMIT 20`)
 	var candidates []resumeCandidate
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var c resumeCandidate
-			if err := rows.Scan(&c.SessionID, &c.LastActive); err == nil {
-				candidates = append(candidates, c)
-			}
-		}
-	}
-
-	// Enrich each candidate with the provider from its most recent assistant message.
-	for i := range candidates {
-		candidates[i].ProviderID = w.fetchSessionProvider(ctx, candidates[i].SessionID)
+	for _, info := range w.store.List(20) {
+		candidates = append(candidates, resumeCandidate{SessionID: info.ID, Title: info.Title, Model: info.Model, Updated: info.Updated})
 	}
 
 	if len(candidates) == 0 {
@@ -1805,18 +1739,20 @@ func (w *Watcher) handleAmbiguousResume(rec *SessionRecord, content string, atts
 		return
 	}
 
-	// Build numbered list with provider and last-active age.
+	// Build numbered list with title, model and last-active age.
 	var sb strings.Builder
 	sb.WriteString("**Multiple sessions available — reply `!resume <n>` to choose:**\n")
-	now := time.Now().UnixMilli()
 	for i, c := range candidates {
-		ageMS := now - c.LastActive
-		ageStr := formatAge(ageMS)
-		provider := c.ProviderID
-		if provider == "" {
-			provider = "unknown"
+		model := c.Model
+		if model == "" {
+			model = "unknown"
 		}
-		sb.WriteString(fmt.Sprintf("%d. `%s` | provider: `%s` | last active: %s\n", i+1, c.SessionID, provider, ageStr))
+		title := c.Title
+		if title == "" {
+			title = "(untitled)"
+		}
+		sb.WriteString(fmt.Sprintf("%d. `%s` | %s | model: `%s` | last active: %s\n",
+			i+1, c.SessionID, strings.ReplaceAll(title, "`", "'"), model, formatAge(time.Since(c.Updated).Milliseconds())))
 	}
 
 	w.sendToThread(rec.ThreadID, strings.TrimRight(sb.String(), "\n"))
@@ -1828,30 +1764,6 @@ func (w *Watcher) handleAmbiguousResume(rec *SessionRecord, content string, atts
 		atts:       atts,
 		rec:        rec,
 	})
-}
-
-// fetchSessionProvider returns the provider ID from the most recent assistant
-// message in the session. The provider is stored in message.data JSON as
-// model.providerID (per TRANSCRIPT-SCHEMA.md).
-func (w *Watcher) fetchSessionProvider(ctx context.Context, sessionID string) string {
-	// Find the most recent assistant message for this session.
-	var data string
-	err := w.db.QueryRowContext(ctx,
-		`SELECT data FROM message WHERE session_id = ? ORDER BY time_created DESC LIMIT 1`,
-		sessionID,
-	).Scan(&data)
-	if err != nil || data == "" {
-		return ""
-	}
-	var md struct {
-		Model struct {
-			ProviderID string `json:"providerID"`
-		} `json:"model"`
-	}
-	if err := json.Unmarshal([]byte(data), &md); err != nil {
-		return ""
-	}
-	return md.Model.ProviderID
 }
 
 // formatAge formats a millisecond duration as a human-readable age string.
@@ -1902,205 +1814,45 @@ func (w *Watcher) handleResumeChoiceForThread(threadID, content string) bool {
 	return true
 }
 
-// ─── Stderr-log session identity binding (production mechanism) ────────────
+// handleSpawnFromDiscord spawns a new llmux session in response to a Discord
+// channel message (outside any thread), waits until Claude Code is ready
+// (surfacing a folder-trust dialog to Discord for approval), sends the
+// triggering message as the first prompt, waits for the transcript to appear,
+// binds the session (via mirrorSession).
 //
-// This is the phase-16-verified real protocol (docs/BINDING-PROTOCOL.md):
-// devpass-code is launched with --print-logs --log-level INFO and its stderr
-// is redirected exclusively to one file per launch. When (and only when) that
-// exact process creates a new session row, it logs
-// "message=created id=ses_<ID>" to that file. Because the file is exclusive
-// to the one launched process, no foreign process can ever cause a wrong id
-// to appear in it — this is what makes it sufficient to prove ownership,
-// unlike /proc liveness, row timestamps, or a shared directory, none of which
-// prove who wrote a given row.
-//
-// createdSessionLogRe matches devpass-code's structured log line for session
-// creation, tolerating field order/spacing per logfmt conventions.
-var createdSessionLogRe = regexp.MustCompile(`message=created\s+id=(ses_[A-Za-z0-9_]+)`)
-
-// extractCreatedSessionID reads logPath (a devpass-code stderr redirect file)
-// and returns its one unambiguous created-session ID. Repeated observations of
-// the same ID are harmless, but two distinct IDs are ambiguous evidence and
-// fail closed. Returns ("", false) if the file does not exist, is empty,
-// contains no such line, or contains conflicting creation IDs.
-func extractCreatedSessionID(logPath string) (string, bool) {
-	if logPath == "" {
-		return "", false
-	}
-	data, err := os.ReadFile(logPath)
-	if err != nil {
-		return "", false
-	}
-	matches := createdSessionLogRe.FindAllStringSubmatch(string(data), -1)
-	if len(matches) == 0 {
-		return "", false
-	}
-	id := matches[0][1]
-	for _, match := range matches[1:] {
-		if match[1] != id {
-			return "", false
-		}
-	}
-	return id, true
-}
-
-// paneAliveFn returns true if the tmux pane target is still alive (has a
-// live foreground process). Overridable in tests.
-type paneAliveFn func(target string) bool
-
-// bindSessionByStderrLog is the production identity binder. It polls logPath
-// for a "message=created id=ses_<ID>" line, and for every candidate id it
-// finds, re-verifies BOTH that the tmux pane is alive AT THAT MOMENT (not just
-// at entry) and that the corresponding DB row exists with
-// time_created >= spawnInstant, before returning it as bound. If the pane
-// dies during the wait, or the log never appears, or the DB row is missing or
-// stale, it fails closed: ("", false). It never falls back to nonce, title,
-// row-time-only, or first-row heuristics.
-func bindSessionByStderrLog(
-	ctx context.Context,
-	db *sql.DB,
-	logPath string,
-	tmuxTarget string,
-	spawnInstant int64,
-	timeout time.Duration,
-	paneAlive paneAliveFn,
-) (string, bool) {
-	if logPath == "" {
-		return "", false
-	}
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		select {
-		case <-ctx.Done():
-			return "", false
-		default:
-		}
-
-		// Check liveness at THIS moment, not just at entry: a pane that died
-		// during the wait must never be treated as having produced a row.
-		if !paneAlive(tmuxTarget) {
-			return "", false
-		}
-
-		sid, logOK := extractCreatedSessionID(logPath)
-		if logOK && sid != "" {
-			// Cross-check the DB: the row must exist and be at or after
-			// spawnInstant. A missing or stale row is not evidence of
-			// ownership even if the log line is present (e.g. clock skew or
-			// a corrupted/foreign log path).
-			var createdAt int64
-			err := db.QueryRowContext(ctx,
-				`SELECT time_created FROM session WHERE id = ? AND parent_id IS NULL`,
-				sid,
-			).Scan(&createdAt)
-			if err == nil && createdAt >= spawnInstant {
-				return sid, true
-			}
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	return "", false
-}
-
-// BindSessionByStderrLog is the exported, injectable form used by tests.
-func BindSessionByStderrLog(
-	ctx context.Context,
-	db *sql.DB,
-	logPath string,
-	tmuxTarget string,
-	spawnInstant int64,
-	timeout time.Duration,
-	paneAlive func(target string) bool,
-) (string, bool) {
-	return bindSessionByStderrLog(ctx, db, logPath, tmuxTarget, spawnInstant, timeout, paneAlive)
-}
-
-// handleSpawnFromDiscord spawns a new dpmux session in response to a Discord
-// channel message (outside any thread), waits for the new session row to appear
-// in the DB, binds the session (via mirrorSession), and injects the Discord
-// message as the first prompt.
-//
-// Binding contract (phase-16-verified protocol; see docs/BINDING-PROTOCOL.md):
-//   - spawnStart is recorded BEFORE dpmux is invoked.
-//   - dpmux writes a JSON pending marker containing the spawn instant, tmux
-//     target, and the path to this launch's exclusive stderr log
-//     (StderrLog), and launches devpass-code with --print-logs --log-level
-//     INFO redirected to that file.
-//   - The ONLY accepted evidence is bindSessionByStderrLog: the process's own
-//     stderr log must contain "message=created id=ses_<ID>", the pane must
-//     be alive at the moment that evidence is checked (re-verified on every
-//     poll, not just at entry), and the corresponding DB row must exist with
-//     time_created >= spawnInstant.
-//   - Neither /proc existence alone, process parentage, row timestamps alone,
-//     a title nonce, nor a shared directory is ever treated as sufficient
-//     proof; those may only narrow candidates, never substitute for the log
-//     evidence.
-//   - A missing or ambiguous identity (no log line, pane dies during the
-//     wait, or the row is missing/stale) fails closed: no session is
-//     claimed, no thread is created, and nothing is injected.
-//   - Rows created before the marker's spawnInstant are never accepted.
-//   - Lexicographic ordering of session IDs is never used.
-//
-// TODO(phase9): wrap dpmux invocation with systemd-run for process isolation.
+// Binding contract (docs/BINDING-PROTOCOL.md):
+//   - llmux generates the session id and launches `claude --session-id <id>`;
+//     the pending marker carries that id. A transcript with exactly this id can
+//     only have been written by this launch, so no inference is needed.
+//   - Claude Code writes the transcript only when the first prompt is
+//     submitted, so the prompt is delivered BEFORE the transcript can exist.
+//   - A launch that never becomes ready (dies, refuses, trust denied, times
+//     out), or never writes its transcript within the bind timeout, fails
+//     closed: the spawned tmux session is torn down, no thread is created and
+//     nothing is claimed.
 func (w *Watcher) handleSpawnFromDiscord(ctx context.Context, content string, evAtts []MessageAttachment) error {
-	// Record the spawn start instant BEFORE calling dpmux.
 	spawnStartMS := time.Now().UnixMilli()
+	log.Printf("mirror: spawning llmux (spawnStart=%d)", spawnStartMS)
 
-	// Resolve the dpmux binary.
-	dpmuxBin := w.cfg.DpmuxBin
-	if dpmuxBin == "" {
-		p, err := exec.LookPath("dpmux")
-		if err != nil {
-			return fmt.Errorf("dpmux not found on PATH (set DpmuxBin in Config): %w", err)
-		}
-		dpmuxBin = p
-	}
-
-	// Build the dpmux command.  Inherit the relay's RELAY_STATE_DIR and
-	// RELAY_DEVPASS_DB so dpmux writes the pending marker into the same
-	// directory the relay is watching.
-	cmd := exec.CommandContext(ctx, dpmuxBin)
-	env := os.Environ()
-	if w.cfg.StateDir != "" {
-		env = setEnvVar(env, "RELAY_STATE_DIR", w.cfg.StateDir)
-	}
-	if w.cfg.DBPath != "" {
-		env = setEnvVar(env, "RELAY_DEVPASS_DB", w.cfg.DBPath)
-	}
-	env = setEnvVar(env, "RELAY_NEW_SESSION", "1")
-	// Unset TMUX so dpmux always creates a fresh tmux session (never new-window
-	// in the relay's own session if the relay runs inside tmux).
-	env = setEnvVar(env, "TMUX", "")
-	cmd.Env = env
-
-	var stdoutBuf bytes.Buffer
-	cmd.Stdout = &stdoutBuf
-	cmd.Stderr = os.Stderr
-
-	log.Printf("mirror: spawning dpmux (spawnStart=%d)", spawnStartMS)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("dpmux run: %w", err)
-	}
-
-	// dpmux prints the session name (dp-<unixtime>-<pid>) to stdout.
-	sessionName := strings.TrimSpace(stdoutBuf.String())
+	sessionName, marker, pendingPath, runErr := w.runLlmux(ctx)
 	if sessionName == "" {
-		return fmt.Errorf("dpmux produced no session name on stdout")
+		return fmt.Errorf("llmux run: %w", runErr)
 	}
-	log.Printf("mirror: dpmux spawned session %q", sessionName)
-
-	pendingPath := filepath.Join(w.cfg.StateDir, "pending-"+sessionName)
+	log.Printf("mirror: llmux spawned session %q", sessionName)
 
 	// From here on any failure tears down ONLY this spawn's own tmux session
 	// (addressed by its exact name) and never touches any other pane.
 	spawnTarget := sessionName + ":0.0"
+	if marker.Target != "" {
+		spawnTarget = marker.Target
+	}
 	spawnFail := func(cause error) error {
 		var paneWasAlive bool
 		if strings.HasPrefix(spawnTarget, sessionName+":") {
 			paneWasAlive = isTmuxPaneAlive("=" + spawnTarget)
 			teardownSpawnedSession(sessionName)
 		} else {
-			// dpmux placed the spawn in a window of a host tmux session: kill
+			// llmux placed the spawn in a window of a host tmux session: kill
 			// only that window, never the host session.
 			paneWasAlive = isTmuxPaneAlive(spawnTarget)
 			teardownPaneTarget(spawnTarget)
@@ -2111,44 +1863,22 @@ func (w *Watcher) handleSpawnFromDiscord(ctx context.Context, content string, ev
 			// exists (nothing is bound), so the notice goes to the channel.
 			// A pane that died on its own stays silent (fail closed, no
 			// Discord traffic without verified identity).
-			w.sendToThread(w.cfg.ChannelID, "⚠️ Could not start a new devpass-code session for your message; the spawned session was shut down. Please try again.")
+			w.sendToThread(w.cfg.ChannelID, "⚠️ Could not start a new Claude Code session for your message; the spawned session was shut down. Please try again.")
 		}
 		return cause
 	}
-
-	// Read and parse the pending marker written by dpmux.
-	markerData, readErr := os.ReadFile(pendingPath)
-	if readErr != nil {
-		return spawnFail(fmt.Errorf("read pending marker for %q: %w", sessionName, readErr))
+	if runErr != nil {
+		return spawnFail(runErr)
 	}
-	var marker spawnMarkerJSON
-	if jsonErr := json.Unmarshal(markerData, &marker); jsonErr != nil {
-		// Legacy plain-text marker: treat content as tmux target.
-		marker.Target = strings.TrimSpace(string(markerData))
+	sessionID := marker.SessionID
+	if !transcript.ValidSessionID(sessionID) {
+		return spawnFail(fmt.Errorf("pending marker for %q carries no valid session id", sessionName))
 	}
-	if marker.Target == "" {
-		marker.Target = sessionName + ":0.0"
-	}
-	spawnTarget = marker.Target
-	spawnInstant := marker.SpawnInstant
-	if spawnInstant < spawnStartMS {
-		spawnInstant = spawnStartMS
-	}
-
-	bindTimeout := w.cfg.SpawnBindTimeout
 	tmuxTarget := marker.Target
 
-	if marker.StderrLog == "" {
-		// No identity evidence source at all: fail closed. Never claim or
-		// inject into any row without the phase-16-verified protocol.
-		return spawnFail(fmt.Errorf("pending marker for %q has no stderrLog; cannot verify session identity (spawnStart=%d)", sessionName, spawnStartMS))
-	}
-
-	// 1. Readiness probe. devpass-code 1.18.11 creates its session only after
-	// the first prompt arrives (docs/BINDING-PROTOCOL.md), so the prompt must be
-	// delivered BEFORE identity can exist. A failed probe never binds or mirrors.
-	if !inject.WaitReady(tmuxTarget) {
-		return spawnFail(fmt.Errorf("readiness probe failed for dpmux session %q (target=%s); nothing injected, nothing bound", sessionName, tmuxTarget))
+	// 1. Readiness. A failed probe never binds or mirrors.
+	if err := w.awaitReady(ctx, tmuxTarget, w.cfg.ChannelID); err != nil {
+		return spawnFail(fmt.Errorf("readiness probe failed for llmux session %q (target=%s); nothing injected, nothing bound: %w", sessionName, tmuxTarget, err))
 	}
 
 	// 2. Deliver the triggering message as the first prompt.
@@ -2156,24 +1886,21 @@ func (w *Watcher) handleSpawnFromDiscord(ctx context.Context, content string, ev
 	for _, a := range evAtts {
 		atts = append(atts, inject.Attachment{Filename: a.Filename, URL: a.URL})
 	}
-	if err := w.injector.SendPrompt(tmuxTarget, sessionName, content, atts); err != nil {
-		return spawnFail(fmt.Errorf("inject first prompt into dpmux session %q: %w", sessionName, err))
+	if err := w.injector.SendPrompt(tmuxTarget, sessionID, content, atts); err != nil {
+		return spawnFail(fmt.Errorf("inject first prompt into llmux session %q: %w", sessionName, err))
 	}
 
-	// 3. Only now wait for identity (bind timeout starts after the send): the
-	// spawn's own stderr log must carry exactly one message=created id.
-	boundSessionID, bound := bindSessionByStderrLog(
-		ctx, w.db, marker.StderrLog, tmuxTarget, spawnInstant, bindTimeout, isTmuxPaneAlive,
-	)
-	if !bound || boundSessionID == "" {
-		return spawnFail(fmt.Errorf("timed out or failed to verify session identity for dpmux session %q (spawnStart=%d, stderrLog=%s)", sessionName, spawnStartMS, marker.StderrLog))
+	// 3. Only now wait for the transcript (bind timeout starts after the send).
+	// The pane must stay alive throughout.
+	if err := w.waitForTranscript(ctx, sessionID, tmuxTarget, w.cfg.SpawnBindTimeout); err != nil {
+		return spawnFail(fmt.Errorf("session %s of llmux session %q never produced a transcript: %w", sessionID, sessionName, err))
 	}
 
-	log.Printf("mirror: bound new session %s to dpmux %s (target=%s)", boundSessionID, sessionName, tmuxTarget)
+	log.Printf("mirror: bound new session %s to llmux %s (target=%s)", sessionID, sessionName, tmuxTarget)
 
 	// Atomically claim the session.  If scanSessions won the race and already
-	// claimed it, mirrorSession is running; we only need to inject the prompt.
-	needsMirror := w.claimed.tryAdd(boundSessionID)
+	// claimed it, mirrorSession is running and nothing else is needed.
+	needsMirror := w.claimed.tryAdd(sessionID)
 
 	// Remove the pending marker so scanSessions won't try to bind it again.
 	os.Remove(pendingPath)
@@ -2182,24 +1909,47 @@ func (w *Watcher) handleSpawnFromDiscord(ctx context.Context, content string, ev
 		// Register the session into sessions.json so that scanSessions' `seen` map
 		// picks it up on the next tick and skips it.
 		if err := w.sessions.Upsert(&SessionRecord{
-			SessionID:  boundSessionID,
+			SessionID:  sessionID,
 			TmuxTarget: tmuxTarget,
 			Status:     "active",
 		}); err != nil {
-			log.Printf("mirror: sessions.json pre-upsert for %s: %v", boundSessionID, err)
+			log.Printf("mirror: sessions.json pre-upsert for %s: %v", sessionID, err)
 		}
 
 		// Mirror the session concurrently (same as scanSessions does).
-		var createdAt int64
-		w.db.QueryRowContext(ctx, `SELECT time_created FROM session WHERE id = ?`, boundSessionID).Scan(&createdAt)
-		go func(sid, target string, ca int64) {
-			if err := w.mirrorSession(ctx, sid, target, ca); err != nil {
+		go func(sid, target string) {
+			if err := w.mirrorSession(ctx, sid, target); err != nil {
 				log.Printf("mirror: mirrorSession(spawn) %s: %v", sid, err)
 			}
-		}(boundSessionID, tmuxTarget, createdAt)
+		}(sessionID, tmuxTarget)
 	}
 
 	return nil
+}
+
+// waitForTranscript waits for sessionID's transcript, failing if the pane dies
+// or the timeout passes.
+func (w *Watcher) waitForTranscript(ctx context.Context, sessionID, tmuxTarget string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := w.store.Path(sessionID); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		// Re-verified on every poll: a pane that died during the wait never
+		// counts as having produced a session.
+		if !isTmuxPaneAlive(tmuxTarget) {
+			return fmt.Errorf("pane %s died", tmuxTarget)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after %v", timeout)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 // setEnvVar sets (or replaces) a KEY=VALUE pair in the given env slice.

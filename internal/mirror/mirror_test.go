@@ -1,14 +1,12 @@
 package mirror_test
 
 import (
-	"encoding/json"
 	"os/exec"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/syedmusaasad/LLMDiscordRelay/internal/mirror"
-	"github.com/syedmusaasad/LLMDiscordRelay/internal/transcript"
 )
 
 // ── TeardownPane tests ────────────────────────────────────────────────────────
@@ -208,131 +206,6 @@ func TestThrottle_IndependentChannels(t *testing.T) {
 		t.Fatal("ch-b should not have been throttled by ch-a's limit")
 	}
 }
-
-// ── Part classification tests ─────────────────────────────────────────────────
-
-func TestClassifyPart_AssistantText(t *testing.T) {
-	p := transcript.Part{
-		ID:        "prt1",
-		MessageID: "msg1",
-		SessionID: "ses1",
-		Data:      json.RawMessage(`{"type":"text","text":"Hello from assistant"}`),
-	}
-	cp := mirror.ClassifyPart(p, "assistant", false)
-	if cp.Kind != mirror.PartKindText {
-		t.Errorf("expected PartKindText, got %v", cp.Kind)
-	}
-	if cp.Text != "Hello from assistant" {
-		t.Errorf("expected text %q, got %q", "Hello from assistant", cp.Text)
-	}
-	if cp.IsPreamble {
-		t.Error("expected IsPreamble=false")
-	}
-}
-
-func TestClassifyPart_UserTextNotPreamble(t *testing.T) {
-	p := transcript.Part{
-		ID:        "prt2",
-		MessageID: "msg2",
-		SessionID: "ses1",
-		Data:      json.RawMessage(`{"type":"text","text":"ping"}`),
-	}
-	// isPreambleMsg=false → this is the user's typed prompt
-	cp := mirror.ClassifyPart(p, "user", false)
-	if cp.Kind != mirror.PartKindText {
-		t.Errorf("expected PartKindText, got %v", cp.Kind)
-	}
-	if cp.IsPreamble {
-		t.Error("expected IsPreamble=false")
-	}
-}
-
-func TestClassifyPart_PreambleBearingUserMessage(t *testing.T) {
-	// A user message with isPreambleMsg=true must be classified as Preamble,
-	// NOT as PartKindText. This is the core invariant: preamble-bearing user
-	// messages must NOT count as a second prompt.
-	p := transcript.Part{
-		ID:        "prt3",
-		MessageID: "msg3",
-		SessionID: "ses1",
-		Data:      json.RawMessage(`{"type":"text","text":"system context preamble"}`),
-	}
-	cp := mirror.ClassifyPart(p, "user", true) // isPreambleMsg=true
-	if cp.Kind != mirror.PartKindPreamble {
-		t.Errorf("expected PartKindPreamble, got %v", cp.Kind)
-	}
-	if !cp.IsPreamble {
-		t.Error("expected IsPreamble=true")
-	}
-	if cp.Kind == mirror.PartKindText {
-		t.Error("preamble-bearing user part must not be classified as PartKindText (second prompt)")
-	}
-}
-
-func TestClassifyPart_ToolCall(t *testing.T) {
-	p := transcript.Part{
-		ID:        "prt4",
-		MessageID: "msg4",
-		SessionID: "ses1",
-		Data:      json.RawMessage(`{"type":"tool","tool":"bash","callID":"call_abc123","state":{"status":"running"}}`),
-	}
-	cp := mirror.ClassifyPart(p, "assistant", false)
-	if cp.Kind != mirror.PartKindToolCall {
-		t.Errorf("expected PartKindToolCall, got %v", cp.Kind)
-	}
-	if cp.ToolName != "bash" {
-		t.Errorf("expected tool name 'bash', got %q", cp.ToolName)
-	}
-}
-
-func TestClassifyPart_StepFinish(t *testing.T) {
-	p := transcript.Part{
-		ID:        "prt5",
-		MessageID: "msg5",
-		SessionID: "ses1",
-		Data:      json.RawMessage(`{"reason":"stop","type":"step-finish","tokens":{"total":100},"cost":0.001}`),
-	}
-	cp := mirror.ClassifyPart(p, "assistant", false)
-	if cp.Kind != mirror.PartKindStepFinish {
-		t.Errorf("expected PartKindStepFinish, got %v", cp.Kind)
-	}
-}
-
-func TestClassifyPart_StepStart(t *testing.T) {
-	p := transcript.Part{
-		ID:        "prt6",
-		MessageID: "msg6",
-		SessionID: "ses1",
-		Data:      json.RawMessage(`{"type":"step-start"}`),
-	}
-	cp := mirror.ClassifyPart(p, "assistant", false)
-	if cp.Kind != mirror.PartKindStepStart {
-		t.Errorf("expected PartKindStepStart, got %v", cp.Kind)
-	}
-}
-
-func TestIsPreambleMessage_WithAgent(t *testing.T) {
-	data := json.RawMessage(`{"role":"user","agent":"pl-interactive","model":{"providerID":"test"}}`)
-	if !mirror.IsPreambleMessage(data) {
-		t.Error("expected user message with agent to be preamble")
-	}
-}
-
-func TestIsPreambleMessage_WithoutAgent(t *testing.T) {
-	data := json.RawMessage(`{"role":"user","time":{"created":12345}}`)
-	if mirror.IsPreambleMessage(data) {
-		t.Error("expected user message without agent to NOT be preamble")
-	}
-}
-
-func TestIsPreambleMessage_Assistant(t *testing.T) {
-	data := json.RawMessage(`{"role":"assistant","agent":"pl-interactive"}`)
-	if mirror.IsPreambleMessage(data) {
-		t.Error("expected assistant message to NOT be preamble")
-	}
-}
-
-// ── helpers ───────────────────────────────────────────────────────────────────
 
 func repeat(s string, n int) string {
 	result := ""

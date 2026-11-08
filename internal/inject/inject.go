@@ -1,15 +1,16 @@
-// Package inject sends Discord thread replies into a live devpass-code tmux pane.
+// Package inject sends Discord thread replies into a live Claude Code tmux pane.
 //
 // Flow:
 //  1. Only messages from DISCORD_USER_ID are honoured; bots and other authors are dropped.
-//  2. Readiness probe: capture-pane polls for the TUI ready signature up to
-//     30 s (see PaneReady: the first-screen "Ask anything..." placeholder OR the
-//     persistent input row); falls back to a fixed 2 s sleep if the pane never
-//     becomes ready.
+//  2. Readiness probe: capture-pane polls for the idle TUI (see PaneReady: an
+//     input line between two rules and no "esc to interrupt" footer) up to 30 s;
+//     falls back to a fixed 2 s sleep if the pane never becomes ready.
 //  3. Image attachments are downloaded to <stateDir>/staging/<sessionID>/ with
 //     filenames sanitised of exotic whitespace.  Their local path is appended to the
 //     injected text.
-//  4. `tmux send-keys -t <target> -l <text>` then Enter.
+//  4. Single-line text goes through `tmux send-keys -l`; multi-line text is
+//     pasted with load-buffer/paste-buffer -p (bracketed paste), because
+//     send-keys would submit at the first newline. Enter then submits.
 //  5. `!title <t>` renames the Discord thread.
 package inject
 
@@ -21,7 +22,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 	"unicode"
@@ -30,33 +30,12 @@ import (
 )
 
 const (
-	readinessProbeTimeout = 30 * time.Second
-	readinessProbePoll    = 200 * time.Millisecond
-	readinessFallback     = 2 * time.Second
-	readinessSignature    = "Ask anything..."
+	// ReadyTimeout bounds how long WaitReady polls.
+	ReadyTimeout       = 30 * time.Second
+	readinessProbePoll = 200 * time.Millisecond
+	readinessFallback  = 2 * time.Second
+	pasteSettle        = 150 * time.Millisecond
 )
-
-// inputRowRe matches the persistent input-row marker of the 1.18.11 TUI: the
-// "Pl-Interactive" agent line drawn inside the input bar (┃ prefix). Unlike the
-// "Ask anything..." placeholder it is still on screen after the first turn.
-var inputRowRe = regexp.MustCompile(`(?m)^\s*┃\s+Pl-Interactive\b`)
-
-// inputBarRe matches the bottom border of the input bar (╹▀▀▀…).
-var inputBarRe = regexp.MustCompile(`(?m)^\s*╹▀{3,}`)
-
-// PaneReady reports whether captured pane text shows a TUI that accepts input.
-// Pinned to devpass-code 1.18.11:
-//   - fresh pane: the "Ask anything..." placeholder;
-//   - post-turn pane (placeholder gone): the "┃  Pl-Interactive …" input row
-//     directly above the "╹▀▀▀" input-bar border.
-//
-// Observed signatures are recorded in docs/REMEDIATION-24.md.
-func PaneReady(text string) bool {
-	if strings.Contains(text, readinessSignature) {
-		return true
-	}
-	return inputRowRe.MatchString(text) && inputBarRe.MatchString(text)
-}
 
 // ThreadRenamer is an optional interface a Discord client may implement to
 // rename a thread.
@@ -97,7 +76,7 @@ func ShouldAcceptAuthor(authorID string, isBot bool, allowedUserID string) bool 
 // Parameters:
 //
 //	target      – tmux pane target, e.g. "mysession:0.0"
-//	sessionID   – devpass session ID (used for staging dir)
+//	sessionID   – Claude Code session ID (used for staging dir)
 //	content     – message text
 //	attachments – list of (filename, url) pairs for image attachments
 func (inj *Injector) Inject(target, sessionID, content string, attachments []Attachment) error {
@@ -113,7 +92,7 @@ func (inj *Injector) Inject(target, sessionID, content string, attachments []Att
 	waitForReady(target)
 
 	// Send to pane
-	return sendKeysLiteral(target, text)
+	return SendText(target, text)
 }
 
 // SendPrompt downloads attachments and sends the text WITHOUT running the
@@ -124,7 +103,7 @@ func (inj *Injector) SendPrompt(target, sessionID, content string, attachments [
 	if err != nil {
 		log.Printf("inject: attachment download partial error: %v", err)
 	}
-	return sendKeysLiteral(target, joinText(content, extraPaths))
+	return SendText(target, joinText(content, extraPaths))
 }
 
 func joinText(content string, extraPaths []string) string {
@@ -234,7 +213,7 @@ func waitForReady(target string) {
 // WaitReady polls the pane until PaneReady, for at most 30 s. It returns false
 // on timeout, or early if the pane cannot be captured for ~1 s (pane gone).
 func WaitReady(target string) bool {
-	deadline := time.Now().Add(readinessProbeTimeout)
+	deadline := time.Now().Add(ReadyTimeout)
 	captureErrs := 0
 	for time.Now().Before(deadline) {
 		text, err := capturePaneText(target)
@@ -264,20 +243,57 @@ func capturePaneText(target string) (string, error) {
 	return string(out), nil
 }
 
-// sendKeysLiteral sends text to a tmux pane using -l (literal) mode, then Enter.
-func sendKeysLiteral(target, text string) error {
+var pasteSeq uint64
+
+// SendText submits text to the pane as one prompt. Multi-line text is pasted
+// with bracketed paste so its newlines stay inside the prompt.
+func SendText(target, text string) error {
 	tmuxBin, err := tmuxctl.ResolveTmuxBin()
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(tmuxBin, "send-keys", "-t", target, "-l", text)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("inject: send-keys literal: %w: %s", err, out)
+	text = strings.ReplaceAll(strings.ReplaceAll(text, "\r\n", "\n"), "\r", "\n")
+	if strings.Contains(text, "\n") {
+		if err := pasteBuffer(tmuxBin, target, text); err != nil {
+			return err
+		}
+		time.Sleep(pasteSettle)
+	} else {
+		cmd := exec.Command(tmuxBin, "send-keys", "-t", target, "-l", text)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("inject: send-keys literal: %w: %s", err, out)
+		}
 	}
-	// Press Enter
 	cmd2 := exec.Command(tmuxBin, "send-keys", "-t", target, "", "Enter")
 	if out, err := cmd2.CombinedOutput(); err != nil {
 		return fmt.Errorf("inject: send-keys enter: %w: %s", err, out)
+	}
+	return nil
+}
+
+// pasteBuffer loads text into a private tmux buffer and pastes it (bracketed,
+// -p) into target. paste-buffer -d deletes the buffer afterwards.
+func pasteBuffer(tmuxBin, target, text string) error {
+	f, err := os.CreateTemp("", "llm-relay-paste-*")
+	if err != nil {
+		return fmt.Errorf("inject: paste temp file: %w", err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.WriteString(text); err != nil {
+		f.Close()
+		return fmt.Errorf("inject: paste temp file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	pasteSeq++
+	name := fmt.Sprintf("llmrelay-%d-%d", os.Getpid(), pasteSeq)
+	if out, err := exec.Command(tmuxBin, "load-buffer", "-b", name, f.Name()).CombinedOutput(); err != nil {
+		return fmt.Errorf("inject: load-buffer: %w: %s", err, out)
+	}
+	if out, err := exec.Command(tmuxBin, "paste-buffer", "-p", "-d", "-b", name, "-t", target).CombinedOutput(); err != nil {
+		_ = exec.Command(tmuxBin, "delete-buffer", "-b", name).Run()
+		return fmt.Errorf("inject: paste-buffer: %w: %s", err, out)
 	}
 	return nil
 }

@@ -21,9 +21,9 @@ build:
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) \
 	  go build -trimpath -ldflags="-s -w" -o $(BIN) ./cmd/relay
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) \
-	  go build -trimpath -ldflags="-s -w" -o bin/dpmux ./cmd/dpmux
+	  go build -trimpath -ldflags="-s -w" -o bin/llmux ./cmd/llmux
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) \
-	  go build -trimpath -ldflags="-s -w" -o bin/fake-devpass-code ./cmd/fake-devpass-code
+	  go build -trimpath -ldflags="-s -w" -o bin/fake-claude ./cmd/fake-claude
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) \
 	  go build -trimpath -ldflags="-s -w" -o bin/mock-discord ./cmd/mock-discord
 
