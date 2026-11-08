@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devpass/devpass-discord-relay/internal/transcript"
+	"github.com/syedmusaasad/LLMDiscordRelay/internal/transcript"
 	_ "modernc.org/sqlite"
 )
 

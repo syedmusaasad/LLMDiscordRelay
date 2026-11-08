@@ -1,4 +1,4 @@
-module github.com/devpass/devpass-discord-relay
+module github.com/syedmusaasad/LLMDiscordRelay
 
 go 1.27.1
 

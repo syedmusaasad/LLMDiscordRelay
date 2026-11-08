@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devpass/devpass-discord-relay/internal/mirror"
-	"github.com/devpass/devpass-discord-relay/internal/transcript"
+	"github.com/syedmusaasad/LLMDiscordRelay/internal/mirror"
+	"github.com/syedmusaasad/LLMDiscordRelay/internal/transcript"
 )
 
 // ── TeardownPane tests ────────────────────────────────────────────────────────

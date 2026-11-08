@@ -19,9 +19,9 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/devpass/devpass-discord-relay/internal/inject"
-	"github.com/devpass/devpass-discord-relay/internal/tmuxctl"
-	"github.com/devpass/devpass-discord-relay/internal/transcript"
+	"github.com/syedmusaasad/LLMDiscordRelay/internal/inject"
+	"github.com/syedmusaasad/LLMDiscordRelay/internal/tmuxctl"
+	"github.com/syedmusaasad/LLMDiscordRelay/internal/transcript"
 )
 
 // Config holds relay watcher configuration.

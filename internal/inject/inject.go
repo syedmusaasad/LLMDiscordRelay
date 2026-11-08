@@ -26,7 +26,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/devpass/devpass-discord-relay/internal/tmuxctl"
+	"github.com/syedmusaasad/LLMDiscordRelay/internal/tmuxctl"
 )
 
 const (

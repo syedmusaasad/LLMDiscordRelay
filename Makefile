@@ -4,7 +4,7 @@ export CGO_ENABLED := 0
 export TMPDIR := $(CURDIR)/.tmp
 
 BIN       := bin/relay
-MODULE    := github.com/devpass/devpass-discord-relay
+MODULE    := github.com/syedmusaasad/LLMDiscordRelay
 GOOS      ?= linux
 GOARCH    ?= amd64
 

@@ -3,7 +3,7 @@ package mirror
 import (
 	"encoding/json"
 
-	"github.com/devpass/devpass-discord-relay/internal/transcript"
+	"github.com/syedmusaasad/LLMDiscordRelay/internal/transcript"
 )
 
 // PartKind classifies a transcript part.

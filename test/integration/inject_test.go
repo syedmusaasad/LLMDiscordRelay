@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devpass/devpass-discord-relay/internal/inject"
+	"github.com/syedmusaasad/LLMDiscordRelay/internal/inject"
 	_ "modernc.org/sqlite"
 )
 

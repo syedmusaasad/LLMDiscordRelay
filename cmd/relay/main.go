@@ -31,9 +31,9 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/devpass/devpass-discord-relay/internal/mirror"
-	"github.com/devpass/devpass-discord-relay/internal/telemetry"
-	"github.com/devpass/devpass-discord-relay/internal/tmuxctl"
+	"github.com/syedmusaasad/LLMDiscordRelay/internal/mirror"
+	"github.com/syedmusaasad/LLMDiscordRelay/internal/telemetry"
+	"github.com/syedmusaasad/LLMDiscordRelay/internal/tmuxctl"
 	_ "modernc.org/sqlite"
 )
 
