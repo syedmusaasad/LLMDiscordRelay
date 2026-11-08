@@ -422,3 +422,60 @@ func TestTrustDialogTimeoutDenies(t *testing.T) {
 		t.Fatalf("awaitReady = %v, want errTrustDenied after timeout", err)
 	}
 }
+
+func TestHandleAmbiguousResumeSplitsLongList(t *testing.T) {
+	root := t.TempDir()
+	proj := filepath.Join(root, "-work-demo")
+	if err := os.MkdirAll(proj, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for i := 0; i < 20; i++ {
+		id := fmt.Sprintf("aaaaaaaa-bbbb-4ccc-8ddd-%012d", i)
+		ids = append(ids, id)
+		title := strings.Repeat("t", 80)
+		body := fmt.Sprintf(`{"type":"ai-title","aiTitle":%q}`+"\n", title)
+		if err := os.WriteFile(filepath.Join(proj, id+".jsonl"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dc := newRecordingClient()
+	w := newTestWatcher(t, dc, root)
+	w.handleAmbiguousResume(&SessionRecord{ThreadID: "thread-1"}, "hi", nil)
+
+	got := dc.final()
+	if len(got) < 2 {
+		t.Fatalf("expected the list to be split across messages, got %d", len(got))
+	}
+	all := strings.Join(got, "\n")
+	for i, m := range got {
+		if n := len([]rune(m)); n > 2000 {
+			t.Errorf("message %d has %d chars, over Discord's 2000 limit", i, n)
+		}
+	}
+	for _, id := range ids {
+		if !strings.Contains(all, id) {
+			t.Errorf("candidate %s missing from posted messages", id)
+		}
+	}
+	for n := 1; n <= 20; n++ {
+		if !strings.Contains(all, fmt.Sprintf("%d. `", n)) {
+			t.Errorf("entry number %d missing", n)
+		}
+	}
+}
+
+func TestWaitForTranscriptDeadPaneWithExistingTranscriptFails(t *testing.T) {
+	root := filepath.Join("..", "..", "testdata", "claude")
+	w := newTestWatcher(t, newRecordingClient(), root)
+	if _, err := w.store.Path(testSessionID); err != nil {
+		t.Fatalf("fixture transcript must exist: %v", err)
+	}
+	err := w.waitForTranscript(context.Background(), testSessionID, "no-such-session-xyz:0.0", 5*time.Second)
+	if err == nil {
+		t.Fatal("waitForTranscript succeeded for a dead pane; it must fail closed")
+	}
+	if !strings.Contains(err.Error(), "died") {
+		t.Errorf("err = %v, want pane-died error", err)
+	}
+}

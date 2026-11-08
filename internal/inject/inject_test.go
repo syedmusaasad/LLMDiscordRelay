@@ -2,6 +2,7 @@ package inject
 
 import (
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -192,5 +193,32 @@ func TestResumeRefused(t *testing.T) {
 	}
 	if IsResumeRefused(readyPane) {
 		t.Fatal("false positive refusal")
+	}
+}
+
+func TestNextBufferNameUniqueUnderConcurrency(t *testing.T) {
+	const goroutines, perG = 64, 200
+	names := make(chan string, goroutines*perG)
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perG; i++ {
+				names <- nextBufferName()
+			}
+		}()
+	}
+	wg.Wait()
+	close(names)
+	seen := map[string]bool{}
+	for n := range names {
+		if seen[n] {
+			t.Fatalf("duplicate tmux buffer name %q", n)
+		}
+		seen[n] = true
+	}
+	if len(seen) != goroutines*perG {
+		t.Fatalf("got %d names, want %d", len(seen), goroutines*perG)
 	}
 }

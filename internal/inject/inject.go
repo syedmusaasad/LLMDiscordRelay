@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -243,7 +244,13 @@ func capturePaneText(target string) (string, error) {
 	return string(out), nil
 }
 
-var pasteSeq uint64
+var pasteSeq atomic.Uint64
+
+// nextBufferName returns a tmux buffer name unique per call (pid + atomic
+// sequence), safe for concurrent injections.
+func nextBufferName() string {
+	return fmt.Sprintf("llmrelay-%d-%d", os.Getpid(), pasteSeq.Add(1))
+}
 
 // SendText submits text to the pane as one prompt. Multi-line text is pasted
 // with bracketed paste so its newlines stay inside the prompt.
@@ -286,8 +293,7 @@ func pasteBuffer(tmuxBin, target, text string) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	pasteSeq++
-	name := fmt.Sprintf("llmrelay-%d-%d", os.Getpid(), pasteSeq)
+	name := nextBufferName()
 	if out, err := exec.Command(tmuxBin, "load-buffer", "-b", name, f.Name()).CombinedOutput(); err != nil {
 		return fmt.Errorf("inject: load-buffer: %w: %s", err, out)
 	}

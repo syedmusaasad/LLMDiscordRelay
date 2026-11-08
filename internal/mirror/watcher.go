@@ -1767,7 +1767,15 @@ func (w *Watcher) handleAmbiguousResume(rec *SessionRecord, content string, atts
 			i+1, c.SessionID, strings.ReplaceAll(title, "`", "'"), model, formatAge(time.Since(c.Updated).Milliseconds())))
 	}
 
-	w.sendToThread(rec.ThreadID, strings.TrimRight(sb.String(), "\n"))
+	// Split on line boundaries so each message stays within Discord's 2000
+	// char limit; entry numbering is already continuous in the full text.
+	for _, chunk := range ChunkText(strings.TrimRight(sb.String(), "\n"), 2000) {
+		chunk = strings.Trim(chunk, "\n")
+		if chunk == "" {
+			continue
+		}
+		w.sendToThread(rec.ThreadID, chunk)
+	}
 
 	// Store the pending entry so the next `!resume <n>` resolves it.
 	w.pendingResume.set(rec.ThreadID, &pendingResumeEntry{
@@ -1944,21 +1952,22 @@ func (w *Watcher) handleSpawnFromDiscord(ctx context.Context, content string, ev
 func (w *Watcher) waitForTranscript(ctx context.Context, sessionID, tmuxTarget string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
-		if _, err := w.store.Path(sessionID); err == nil {
-			return nil
-		}
+		// Fail closed: context, pane liveness and the deadline are all checked
+		// on every iteration BEFORE a transcript is accepted, so a transcript
+		// that appeared just before the pane died never binds.
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		// Re-verified on every poll: a pane that died during the wait never
-		// counts as having produced a session.
 		if !isTmuxPaneAlive(tmuxTarget) {
 			return fmt.Errorf("pane %s died", tmuxTarget)
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("timed out after %v", timeout)
+		}
+		if _, err := w.store.Path(sessionID); err == nil {
+			return nil
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
