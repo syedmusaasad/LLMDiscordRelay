@@ -157,6 +157,8 @@ type Watcher struct {
 	// the transcript (due to inject retry) must not be posted again.
 	suppressedEchoes    suppressedEchoStore
 	pendingInteractions pendingInteractionStore
+	// capturePane reads a pane for click-time validation; nil means tmux.
+	capturePane func(target string) (string, error)
 	// mirrors holds the cancel func of the live content mirror per session, so a
 	// resumed session's new mirror supersedes the one of its dead pane.
 	mirrorsMu sync.Mutex
@@ -169,8 +171,9 @@ type mirrorHandle struct{ cancel context.CancelFunc }
 // component message. It prevents duplicate clicks and lets the timeout race be
 // resolved exactly once.
 type pendingInteractionStore struct {
-	mu      sync.Mutex
-	entries map[string]pendingInteraction
+	mu       sync.Mutex
+	entries  map[string]pendingInteraction
+	resolved map[string]time.Time
 }
 
 type pendingInteraction struct {
@@ -179,7 +182,43 @@ type pendingInteraction struct {
 	messageID string
 	kind      string
 	options   int
+	signature string    // the action/question this entry was posted for
 	result    chan bool // kind "trust": receives the final decision
+}
+
+// interactionGrace is how long a resolved interaction suppresses a re-post of
+// an identical prompt: the pane still shows the old prompt until the key lands.
+const interactionGrace = 1500 * time.Millisecond
+
+func interactionKey(threadID, target, kind string) string {
+	return threadID + "\x00" + target + "\x00" + kind
+}
+
+// markResolved records that the interaction of (thread, target, kind) was
+// settled (answered, timed out or retired as stale).
+func (p *pendingInteractionStore) markResolved(threadID, target, kind string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.resolved == nil {
+		p.resolved = make(map[string]time.Time)
+	}
+	p.resolved[interactionKey(threadID, target, kind)] = time.Now()
+}
+
+// clearResolved forgets a settled marker (a fresh interaction was posted).
+func (p *pendingInteractionStore) clearResolved(threadID, target, kind string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.resolved, interactionKey(threadID, target, kind))
+}
+
+// settled reports whether the last interaction was resolved at least grace ago,
+// i.e. a prompt still on screen with the same signature is a new one.
+func (p *pendingInteractionStore) settled(threadID, target, kind string, grace time.Duration) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	at, ok := p.resolved[interactionKey(threadID, target, kind)]
+	return ok && time.Since(at) >= grace
 }
 
 func (p *pendingInteractionStore) put(id string, entry pendingInteraction) {
@@ -646,7 +685,8 @@ func (w *Watcher) mirrorContent(parent context.Context, sessionID, threadID, tmu
 			}
 			if inject.IsPermissionPrompt(pane) {
 				signature := inject.PermissionSignature(pane)
-				if signature != approvalSignature && !w.pendingInteractions.has(threadID, tmuxTarget, "approval") {
+				if !w.pendingInteractions.has(threadID, tmuxTarget, "approval") &&
+					(signature != approvalSignature || w.pendingInteractions.settled(threadID, tmuxTarget, "approval", interactionGrace)) {
 					if w.postApproval(threadID, tmuxTarget, signature) {
 						approvalSignature = signature
 					}
@@ -655,8 +695,9 @@ func (w *Watcher) mirrorContent(parent context.Context, sessionID, threadID, tmu
 				approvalSignature = ""
 			}
 			if q, ok := inject.ParseQuestion(pane); ok {
-				signature := q.Prompt + "\x00" + strings.Join(q.Options, "\x00")
-				if signature != questionSignature && !w.pendingInteractions.has(threadID, tmuxTarget, "question") {
+				signature := questionSignatureOf(q)
+				if !w.pendingInteractions.has(threadID, tmuxTarget, "question") &&
+					(signature != questionSignature || w.pendingInteractions.settled(threadID, tmuxTarget, "question", interactionGrace)) {
 					if w.postQuestion(threadID, tmuxTarget, q) {
 						questionSignature = signature
 					}
@@ -1081,7 +1122,8 @@ func (w *Watcher) postApproval(threadID, target, signature string) bool {
 		log.Printf("mirror: post approval: %v", err)
 		return false
 	}
-	entry := pendingInteraction{target: target, threadID: threadID, messageID: msg.ID, kind: "approval"}
+	entry := pendingInteraction{target: target, threadID: threadID, messageID: msg.ID, kind: "approval", signature: signature}
+	w.pendingInteractions.clearResolved(threadID, target, "approval")
 	w.pendingInteractions.put(approveID, entry)
 	w.pendingInteractions.put(denyID, entry)
 	go func() {
@@ -1095,6 +1137,11 @@ func (w *Watcher) postApproval(threadID, target, signature string) bool {
 				return
 			}
 			w.pendingInteractions.take(denyID)
+			w.pendingInteractions.markResolved(threadID, target, "approval")
+			if !w.paneStillShows(entry) {
+				_ = w.discordEditComponents(threadID, msg.ID, "⌛ **Permission request expired** (the prompt is no longer on screen).", nil)
+				return
+			}
 			if err := tmuxctl.SendRecipe(target, tmuxctl.ApprovalDenyRecipe); err != nil {
 				log.Printf("mirror: approval timeout deny: %v", err)
 				return
@@ -1122,8 +1169,34 @@ func (w *Watcher) postQuestion(threadID, target string, q inject.Question) bool 
 		log.Printf("mirror: post question picker: %v", err)
 		return false
 	}
-	w.pendingInteractions.put(id, pendingInteraction{target: target, threadID: threadID, messageID: msg.ID, kind: "question", options: len(q.Options)})
+	w.pendingInteractions.clearResolved(threadID, target, "question")
+	w.pendingInteractions.put(id, pendingInteraction{target: target, threadID: threadID, messageID: msg.ID, kind: "question", options: len(q.Options), signature: questionSignatureOf(q)})
 	return true
+}
+
+func questionSignatureOf(q inject.Question) string {
+	return q.Prompt + "\x00" + strings.Join(q.Options, "\x00")
+}
+
+// paneStillShows reports whether the pane still shows the very prompt entry was
+// posted for. A button must never act on a different (or vanished) prompt.
+func (w *Watcher) paneStillShows(entry pendingInteraction) bool {
+	capture := w.capturePane
+	if capture == nil {
+		capture = capturePaneText
+	}
+	pane, err := capture(entry.target)
+	if err != nil {
+		return false
+	}
+	switch entry.kind {
+	case "approval":
+		return inject.IsPermissionPrompt(pane) && inject.PermissionSignature(pane) == entry.signature
+	case "question":
+		q, ok := inject.ParseQuestion(pane)
+		return ok && questionSignatureOf(q) == entry.signature
+	}
+	return false
 }
 
 // askTrust surfaces Claude Code's folder-trust dialog to Discord as an approval
@@ -1215,6 +1288,14 @@ func (w *Watcher) handleInteraction(ev InteractionEvent) {
 		} else {
 			other = strings.Replace(ev.CustomID, ":deny:", ":approve:", 1)
 		}
+		// A button only acts on the prompt it was posted for: if the pane moved on
+		// (answered locally, or a different action is showing), retire the pair.
+		if !w.paneStillShows(entry) {
+			w.pendingInteractions.take(other)
+			w.pendingInteractions.markResolved(entry.threadID, entry.target, "approval")
+			_ = w.discordEditComponents(entry.threadID, entry.messageID, "⌛ **Permission request expired** (the prompt changed or was answered elsewhere).", nil)
+			return
+		}
 		if err := tmuxctl.SendRecipe(entry.target, recipe); err != nil {
 			log.Printf("mirror: approval recipe: %v", err)
 			w.pendingInteractions.put(ev.CustomID, entry) // keep the button usable
@@ -1223,6 +1304,7 @@ func (w *Watcher) handleInteraction(ev InteractionEvent) {
 		// Both buttons share one stamp: resolving either retires the pair, which
 		// also disarms the timeout goroutine (it finds nothing to take).
 		w.pendingInteractions.take(other)
+		w.pendingInteractions.markResolved(entry.threadID, entry.target, "approval")
 		_ = w.discordEditComponents(entry.threadID, entry.messageID, note, nil)
 	case "question":
 		if len(ev.Values) != 1 {
@@ -1232,10 +1314,16 @@ func (w *Watcher) handleInteraction(ev InteractionEvent) {
 		if err != nil || option < 0 || option >= entry.options {
 			return
 		}
+		if !w.paneStillShows(entry) {
+			w.pendingInteractions.markResolved(entry.threadID, entry.target, "question")
+			_ = w.discordEditComponents(entry.threadID, entry.messageID, "⌛ **Question expired** (the picker changed or was answered elsewhere).", nil)
+			return
+		}
 		if err := tmuxctl.SelectQuestion(entry.target, option); err != nil {
 			log.Printf("mirror: question recipe: %v", err)
 			return
 		}
+		w.pendingInteractions.markResolved(entry.threadID, entry.target, "question")
 		_ = w.discordEditComponents(entry.threadID, entry.messageID, "✅ **Question answered.**", nil)
 	}
 }

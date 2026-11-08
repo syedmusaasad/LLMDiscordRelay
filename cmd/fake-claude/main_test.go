@@ -43,7 +43,6 @@ func TestTranscriptLinesAreReadableByTheRelay(t *testing.T) {
 	root := t.TempDir()
 	id := "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 	s := &session{id: id, cwd: "/work/demo", root: root}
-	started := time.Now()
 	if err := s.writeUser("hello"); err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +52,7 @@ func TestTranscriptLinesAreReadableByTheRelay(t *testing.T) {
 	if err := s.writeToolResult("toolu_1", rejectedText, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.interrupted(started, "for tool use"); err != nil {
+	if err := s.interrupted("for tool use"); err != nil {
 		t.Fatal(err)
 	}
 	p, err := transcript.Store{Root: root}.Path(id)
@@ -68,11 +67,11 @@ func TestTranscriptLinesAreReadableByTheRelay(t *testing.T) {
 	for _, e := range evs {
 		kinds = append(kinds, e.Kind)
 	}
-	want := []transcript.Kind{transcript.KindUserPrompt, transcript.KindToolCall, transcript.KindToolResult, transcript.KindTurnEnd, transcript.KindTurnEnd}
+	want := []transcript.Kind{transcript.KindUserPrompt, transcript.KindToolCall, transcript.KindToolResult, transcript.KindTurnEnd}
 	if fmt.Sprint(kinds) != fmt.Sprint(want) {
 		t.Fatalf("kinds = %v, want %v", kinds, want)
 	}
-	if !evs[2].IsError || !evs[3].Interrupted {
+	if !evs[2].IsError || !evs[3].Interrupted || len(evs) != 4 {
 		t.Fatalf("events = %+v", evs)
 	}
 }

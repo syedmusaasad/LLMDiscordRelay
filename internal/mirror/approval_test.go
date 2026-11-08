@@ -2,6 +2,7 @@ package mirror
 
 import (
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,6 +29,25 @@ func (e testErr) Error() string { return string(e) }
 
 const errTestSend = testErr("discord down")
 
+// permPane renders a Claude Code permission prompt for the given command.
+func permPane(cmd string) string {
+	return "╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n " + cmd + "\n╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n" +
+		" Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, and always allow\n   3. No\n\n Esc to cancel · Tab to amend\n"
+}
+
+// fakePane is a swappable pane capture for click-time validation.
+type fakePane struct {
+	mu   sync.Mutex
+	text string
+}
+
+func (f *fakePane) set(t string) { f.mu.Lock(); f.text = t; f.mu.Unlock() }
+func (f *fakePane) capture(string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.text, nil
+}
+
 func lastComponentIDs(t *testing.T, dc *recordingClient) (approve, deny string) {
 	t.Helper()
 	dc.mu.Lock()
@@ -50,9 +70,12 @@ func TestApprovalButtonsShareOneIDAndClearTogether(t *testing.T) {
 	w := newTestWatcher(t, dc, t.TempDir())
 	w.cfg.AllowedUserID = "me"
 	dc.OnInteraction(w.handleInteraction)
+	fp := &fakePane{text: permPane("rm -rf x")}
+	w.capturePane = fp.capture
+	sig := inject.PermissionSignature(fp.text)
 
 	for i, deny := range []bool{false, true, false} {
-		if !w.postApproval("chan", target, "rm -rf x") {
+		if !w.postApproval("chan", target, sig) {
 			t.Fatalf("round %d: postApproval failed", i)
 		}
 		approveID, denyID := lastComponentIDs(t, dc)
@@ -83,7 +106,9 @@ func TestApprovalTimerDisarmedByResolution(t *testing.T) {
 	w.cfg.AllowedUserID = "me"
 	w.cfg.ApprovalTimeout = 300 * time.Millisecond
 	dc.OnInteraction(w.handleInteraction)
-	if !w.postApproval("chan", target, "x") {
+	fp := &fakePane{text: permPane("x")}
+	w.capturePane = fp.capture
+	if !w.postApproval("chan", target, inject.PermissionSignature(fp.text)) {
 		t.Fatal("postApproval failed")
 	}
 	_, denyID := lastComponentIDs(t, dc)
@@ -118,5 +143,71 @@ func TestPostFailureReportsNotDelivered(t *testing.T) {
 	}
 	if !w.pendingInteractions.has("chan", target, "approval") || !w.pendingInteractions.has("chan", target, "question") {
 		t.Fatal("recovered posts not pending")
+	}
+}
+
+func TestStaleApprovalButtonDoesNotActOnNewPrompt(t *testing.T) {
+	target := tmuxPane(t, "llm-test-stale", `sleep 30`)
+	dc := newRecordingClient()
+	w := newTestWatcher(t, dc, t.TempDir())
+	w.cfg.AllowedUserID = "me"
+	dc.OnInteraction(w.handleInteraction)
+	fp := &fakePane{text: permPane("rm a")}
+	w.capturePane = fp.capture
+	if !w.postApproval("chan", target, inject.PermissionSignature(fp.text)) {
+		t.Fatal("postApproval failed")
+	}
+	approveID, _ := lastComponentIDs(t, dc)
+	// Action A is resolved locally and Claude now asks about action B.
+	fp.set(permPane("rm b"))
+	dc.onInter(InteractionEvent{ChannelID: "chan", AuthorID: "me", CustomID: approveID})
+	if w.pendingInteractions.has("chan", target, "approval") {
+		t.Fatal("stale interaction was not retired")
+	}
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	found := false
+	for _, e := range dc.edits {
+		if strings.Contains(e, "expired") {
+			found = true
+		}
+		if strings.Contains(e, "approved") {
+			t.Fatalf("stale button approved a different action: %q", e)
+		}
+	}
+	if !found {
+		t.Fatalf("stale click not reported as expired: %v", dc.edits)
+	}
+}
+
+func TestSettledInteractionAllowsIdenticalPromptAgain(t *testing.T) {
+	target := tmuxPane(t, "llm-test-settled", `sleep 30`)
+	dc := newRecordingClient()
+	w := newTestWatcher(t, dc, t.TempDir())
+	w.cfg.AllowedUserID = "me"
+	dc.OnInteraction(w.handleInteraction)
+	fp := &fakePane{text: permPane("rm a")}
+	w.capturePane = fp.capture
+	sig := inject.PermissionSignature(fp.text)
+	if !w.postApproval("chan", target, sig) {
+		t.Fatal("postApproval failed")
+	}
+	approveID, _ := lastComponentIDs(t, dc)
+	dc.onInter(InteractionEvent{ChannelID: "chan", AuthorID: "me", CustomID: approveID})
+	if w.pendingInteractions.settled("chan", target, "approval", time.Hour) {
+		t.Fatal("settled must honour the grace period")
+	}
+	if !w.pendingInteractions.settled("chan", target, "approval", 0) {
+		t.Fatal("resolved approval must count as settled once the grace passed")
+	}
+	// An identical prompt right after: posting must work again and re-arm.
+	if !w.postApproval("chan", target, sig) {
+		t.Fatal("second identical approval failed to post")
+	}
+	if w.pendingInteractions.settled("chan", target, "approval", 0) {
+		t.Fatal("fresh post must clear the settled marker")
+	}
+	if !w.pendingInteractions.has("chan", target, "approval") {
+		t.Fatal("second identical approval not pending")
 	}
 }

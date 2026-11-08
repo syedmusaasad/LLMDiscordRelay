@@ -480,7 +480,7 @@ func (s *session) turn(prompt string) error {
 			return err
 		}
 		if !ok {
-			return s.interrupted(started, "for tool use")
+			return s.interrupted("for tool use")
 		}
 	}
 	if t.Question {
@@ -489,7 +489,7 @@ func (s *session) turn(prompt string) error {
 			return err
 		}
 		if !ok {
-			return s.interrupted(started, "for tool use")
+			return s.interrupted("for tool use")
 		}
 	}
 
@@ -578,7 +578,8 @@ func (s *session) question() (bool, error) {
 }
 
 // interrupted ends a turn the way Claude Code does when the user rejects a tool.
-func (s *session) interrupted(started time.Time, why string) error {
+// Interrupts get no turn_duration record: the interrupt line itself ends the turn.
+func (s *session) interrupted(why string) error {
 	if err := s.writeLine(map[string]any{
 		"type":    "user",
 		"message": map[string]any{"role": "user", "content": []map[string]any{{"type": "text", "text": "[Request interrupted by user " + why + "]"}}},
@@ -586,7 +587,7 @@ func (s *session) interrupted(started time.Time, why string) error {
 		return err
 	}
 	s.history = append(s.history, "  ⎿ Interrupted")
-	return s.writeTurnDuration(started)
+	return nil
 }
 
 // ── transcript writing ──────────────────────────────────────────────────────
