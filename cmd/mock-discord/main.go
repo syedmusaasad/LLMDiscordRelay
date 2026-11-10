@@ -22,6 +22,7 @@
 //	                            begun heartbeating (its listen loop is running)
 //	MOCK_READY_DELAY_MS         optional delay between IDENTIFY and READY (tests)
 //	GET  /control/sent          — return all messages the relay sent (array)
+//	GET  /control/calls         — every accepted REST call: method, path, channel_id, assigned id, body
 //	POST /control/ratelimit     body: {"path":"/channels/X/messages","retry_after":1.0,"count":1}
 //	                            count>0 limits how many consecutive requests to
 //	                            this path receive a 429 before it clears itself
@@ -75,6 +76,18 @@ type server struct {
 	nextMsgID    int64
 	gwPort       string // gateway WS port (for returning in REST gateway endpoint)
 	readyConns   int    // connections that sent IDENTIFY and were sent READY (guarded by mu)
+	calls        []callRecord
+}
+
+// callRecord is one accepted REST request with the id the mock assigned to the
+// object it created, so a live test can tell which channel or thread received
+// which message.
+type callRecord struct {
+	Method    string          `json:"method"`
+	Path      string          `json:"path"`
+	ChannelID string          `json:"channel_id"`
+	ID        string          `json:"id"`
+	Body      json.RawMessage `json:"body,omitempty"`
 }
 
 type storedMsg struct {
@@ -126,6 +139,7 @@ func main() {
 	// Control endpoints
 	mux.HandleFunc("/control/dispatch", srv.handleControlDispatch)
 	mux.HandleFunc("/control/sent", srv.handleControlSent)
+	mux.HandleFunc("/control/calls", srv.handleControlCalls)
 	mux.HandleFunc("/control/ratelimit", srv.handleControlRatelimit)
 	mux.HandleFunc("/control/reqcount", srv.handleControlReqCount)
 
@@ -302,9 +316,11 @@ func (s *server) handleREST(w http.ResponseWriter, r *http.Request) {
 
 	// Record the request body and retain it as a channel message so component
 	// interactions delivered by tests resemble Discord's message payload.
+	var recorded json.RawMessage
 	if r.Body != nil && (r.Method == http.MethodPost || r.Method == http.MethodPatch || r.Method == http.MethodPut) {
 		var body json.RawMessage
 		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+			recorded = body
 			s.mu.Lock()
 			s.sent = append(s.sent, body)
 			s.mu.Unlock()
@@ -314,6 +330,7 @@ func (s *server) handleREST(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.nextMsgID++
 	id := fmt.Sprintf("%d", s.nextMsgID)
+	s.calls = append(s.calls, callRecord{Method: r.Method, Path: path, ChannelID: extractChannelID(path), ID: id, Body: recorded})
 	s.mu.Unlock()
 
 	switch {
@@ -426,6 +443,17 @@ func (s *server) handleControlSent(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// handleControlCalls returns every accepted REST request (method, path, the
+// channel or thread it addressed, the id assigned to what it created, body).
+func (s *server) handleControlCalls(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	out := make([]callRecord, len(s.calls))
+	copy(out, s.calls)
+	s.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
 }
 
 func (s *server) handleControlRatelimit(w http.ResponseWriter, r *http.Request) {

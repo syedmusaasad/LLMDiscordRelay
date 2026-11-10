@@ -15,7 +15,7 @@ import (
 
 // TestRestartSurvival_DisposableUnit starts the relay itself in a disposable
 // user unit, sends a spawn through its Discord path, restarts that unit, and
-// proves the dpmux-created tmux window remains alive outside the relay cgroup.
+// proves the llmux-created tmux window remains alive outside the relay cgroup.
 func TestRestartSurvival_DisposableUnit(t *testing.T) {
 	systemdRun, err := exec.LookPath("systemd-run")
 	if err != nil {
@@ -28,11 +28,11 @@ func TestRestartSurvival_DisposableUnit(t *testing.T) {
 		t.Logf("user-manager probe passed: %s", strings.TrimSpace(string(out)))
 	}
 	mustBin(t, "tmux")
-	relayBin, dpmuxBin, mockDS := mustBin(t, "relay"), mustBin(t, "dpmux"), mustBin(t, "mock-discord")
-	xdg, state, tmuxTmp := t.TempDir(), t.TempDir(), t.TempDir()
+	relayBin, llmuxBin, mockDS := mustBin(t, "relay"), mustBin(t, "llmux"), mustBin(t, "mock-discord")
+	projects, state, tmuxTmp := t.TempDir(), t.TempDir(), t.TempDir()
 	t.Setenv("TMUX_TMPDIR", tmuxTmp)
 	tmuxBin := filepath.Join(t.TempDir(), "relay-test-tmux")
-	// Keep all commands on dpmux's explicit `-L default` socket. TMUX_TMPDIR
+	// Keep all commands on llmux's explicit `-L default` socket. TMUX_TMPDIR
 	// makes that default socket isolated; adding a second -L here would make
 	// the observer look at a different server from the spawned pane.
 	if err := os.WriteFile(tmuxBin, []byte("#!/bin/sh\nexec /usr/bin/tmux \"$@\"\n"), 0755); err != nil {
@@ -45,13 +45,8 @@ func TestRestartSurvival_DisposableUnit(t *testing.T) {
 	}
 	unit := fmt.Sprintf("relay-test-%d", os.Getpid())
 	relayLog := filepath.Join(state, "relay.log")
-	fakeBin := mustBin(t, "fake-devpass-code")
-	seed := exec.Command(fakeBin, "--auto")
-	seed.Env = append(os.Environ(), "XDG_DATA_HOME="+xdg)
-	if err := seed.Run(); err != nil {
-		t.Fatalf("seed read-only relay DB: %v", err)
-	}
-	baseEnv := []string{"XDG_DATA_HOME=" + xdg, "TMUX_TMPDIR=" + tmuxTmp, "RELAY_TMUX_BIN=" + tmuxBin, "RELAY_STATE_DIR=" + state, "RELAY_DEVPASS_DB=" + filepath.Join(xdg, "devpass-code", "opencode.db"), "RELAY_DPMUX_BIN=" + dpmuxBin, "RELAY_DEVPASS_BIN=" + fakeBin, "FAKE_DP_FORCE_NEW_SESSION=1", "DISCORD_TOKEN=test-token", "DISCORD_CHANNEL_ID=test-channel-001", "DISCORD_USER_ID=user-allowed-001", "DISCORD_API_URL=http://127.0.0.1:" + port}
+	fakeBin := mustBin(t, "fake-claude")
+	baseEnv := []string{"RELAY_CLAUDE_PROJECTS=" + projects, "TMUX_TMPDIR=" + tmuxTmp, "RELAY_TMUX_BIN=" + tmuxBin, "RELAY_STATE_DIR=" + state, "RELAY_LLMUX_BIN=" + llmuxBin, "RELAY_AGENT_CMD=" + fakeBin, "DISCORD_TOKEN=test-token", "DISCORD_CHANNEL_ID=test-channel-001", "DISCORD_USER_ID=user-allowed-001", "DISCORD_API_URL=http://127.0.0.1:" + port}
 	// --no-block is essential here: without it systemd-run waits for the
 	// long-running relay to exit, so this test never reaches the restart proof.
 	args := []string{"--user", "--no-block", "--unit", unit, "--property=Restart=no", "env"}
@@ -66,8 +61,7 @@ func TestRestartSurvival_DisposableUnit(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	var target string
 	// Allow the gateway identify/READY exchange to settle before the one real
-	// spawn event. Re-dispatching would legitimately create multiple concurrent
-	// fake CLI writers against the same SQLite database.
+	// spawn event. Re-dispatching would legitimately create several sessions.
 	time.Sleep(time.Second)
 	waitForRelayReady(t, state)
 	if err := dispatchEvent(port, buildMessageEvent("restart-spawn", "test-channel-001", "user-allowed-001", false, "restart proof", nil)); err != nil {
@@ -89,7 +83,7 @@ func TestRestartSurvival_DisposableUnit(t *testing.T) {
 			}
 		}
 		// The relay consumes a verified pending marker quickly. Its durable
-		// sessions store retains the exact dpmux target after that handoff.
+		// sessions store retains the exact llmux target after that handoff.
 		if target == "" {
 			var records []struct {
 				Target string `json:"tmux_target"`
@@ -107,17 +101,16 @@ func TestRestartSurvival_DisposableUnit(t *testing.T) {
 		unitStatus, _ := exec.Command("systemctl", "--user", "status", unit, "--no-pager").CombinedOutput()
 		journal, _ := exec.Command("journalctl", "--user", "-u", unit, "--no-pager").CombinedOutput()
 		logData, _ := os.ReadFile(relayLog)
-		t.Fatalf("relay did not spawn dpmux pending marker\nrelay unit:\n%s\nrelay journal:\n%s\nrelay log:\n%s", unitStatus, journal, logData)
+		t.Fatalf("relay did not spawn an llmux pending marker\nrelay unit:\n%s\nrelay journal:\n%s\nrelay log:\n%s", unitStatus, journal, logData)
 	}
-	if err := waitForPaneTextWithEnv(t, target, "Ask anything...", 10*time.Second, "TMUX_TMPDIR="+tmuxTmp, "RELAY_TMUX_BIN="+tmuxBin); err != nil {
-		stderr, _ := os.ReadFile(filepath.Join(state, "stderr-"+strings.Split(target, ":")[0]+".log"))
+	if err := waitForPaneTextWithEnv(t, target, "? for shortcuts", 10*time.Second, "TMUX_TMPDIR="+tmuxTmp, "RELAY_TMUX_BIN="+tmuxBin); err != nil {
 		unitStatus, _ := exec.Command("systemctl", "--user", "status", unit, "--no-pager").CombinedOutput()
-		t.Fatalf("spawned pane not alive before restart: %v\ndpmux stderr:\n%s\nrelay unit:\n%s", err, stderr, unitStatus)
+		t.Fatalf("spawned pane not alive before restart: %v\nrelay unit:\n%s", err, unitStatus)
 	}
 	if out, err := exec.Command("systemctl", "--user", "restart", unit).CombinedOutput(); err != nil {
 		t.Fatalf("restart original transient relay unit: %v\n%s", err, out)
 	}
-	if err := waitForPaneTextWithEnv(t, target, "Ask anything...", 10*time.Second, "TMUX_TMPDIR="+tmuxTmp, "RELAY_TMUX_BIN="+tmuxBin); err != nil {
+	if err := waitForPaneTextWithEnv(t, target, "? for shortcuts", 10*time.Second, "TMUX_TMPDIR="+tmuxTmp, "RELAY_TMUX_BIN="+tmuxBin); err != nil {
 		t.Fatalf("tmux pane did not survive relay restart: %v", err)
 	}
 }

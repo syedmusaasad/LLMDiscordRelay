@@ -1,6 +1,6 @@
 //go:build integration
 
-// dpmux_test.go: integration tests for cmd/dpmux.
+// llmux_test.go: integration tests for cmd/llmux.
 package integration
 
 import (
@@ -14,33 +14,30 @@ import (
 	"time"
 )
 
-// TestDpmux_MarkerBeforeSpawn verifies that dpmux writes the pending-<name> marker
-// file BEFORE spawning the devpass-code process. This ensures the relay can pair the
-// session even if the process starts and creates a session row before dpmux writes
+// TestLlmux_MarkerBeforeSpawn verifies that llmux writes the pending-<name> marker
+// file BEFORE spawning the the agent process. This ensures the relay can pair the
+// session even if the process starts and creates its transcript before llmux writes
 // the marker.
 //
-// Approach: point RELAY_DEVPASS_BIN at a stub that records whether the marker
+// Approach: point RELAY_AGENT_CMD at a stub that records whether the marker
 // existed at the child's own startup.
-func TestDpmux_MarkerBeforeSpawn(t *testing.T) {
+func TestLlmux_MarkerBeforeSpawn(t *testing.T) {
 	mustBin(t, "tmux")
-	dpmuxBin := mustBin(t, "dpmux")
+	llmuxBin := mustBin(t, "llmux")
 
-	stateDir := dpmuxStateDir(t)
+	stateDir := llmuxStateDir(t)
 	logFile := filepath.Join(t.TempDir(), "marker-check.log")
 
 	// The pending marker is the durable pre-spawn contract. The child observes
 	// it before doing anything else.
-	stubScript := filepath.Join(t.TempDir(), "stub-devpass-code")
+	stubScript := filepath.Join(t.TempDir(), "stub-agent")
 	stubContent := fmt.Sprintf(`#!/bin/sh
-# Stub devpass-code: observe the marker at process startup, then stay alive.
-# dpmux probes RELAY_DEVPASS_BIN with -V/--version before it writes the marker;
-# that probe is not the spawned child and must not record marker state.
-case "$1" in -V|--version) exit 0 ;; esac
+# Stub agent: observe the marker at process startup, then stay alive.
 marker_found=false
 for marker in "$RELAY_STATE_DIR"/pending-*; do
   if [ -e "$marker" ]; then marker_found=true; fi
 done
-printf 'marker_found=%%s\n' "$marker_found" > "%s"
+printf 'marker_found=%%s args=%%s %%s\n' "$marker_found" "$1" "$2" > "%s"
 # Sleep briefly so tmux session stays alive long enough to be useful.
 sleep 1
 `, logFile)
@@ -48,18 +45,18 @@ sleep 1
 		t.Fatalf("write stub script: %v", err)
 	}
 
-	// Run dpmux with the stub as the devpass-code binary.
-	cmd := exec.Command(dpmuxBin)
+	// Run llmux with the stub as the agent command.
+	cmd := exec.Command(llmuxBin)
 	var outBuf strings.Builder
 	cmd.Env = append(os.Environ(),
-		fmt.Sprintf("RELAY_DEVPASS_BIN=%s", stubScript),
+		fmt.Sprintf("RELAY_AGENT_CMD=%s", stubScript),
 		fmt.Sprintf("RELAY_STATE_DIR=%s", stateDir),
-		"TMUX=", // unset TMUX so dpmux creates a fresh session
+		"TMUX=", // unset TMUX so llmux creates a fresh session
 	)
 	cmd.Stdout = &outBuf
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		t.Logf("dpmux exit: %v (may be expected if tmux session exits cleanly)", err)
+		t.Logf("llmux exit: %v (may be expected if tmux session exits cleanly)", err)
 	}
 	if sessionName := strings.TrimSpace(outBuf.String()); sessionName != "" {
 		t.Cleanup(func() { _ = exec.Command("tmux", "kill-session", "-t", sessionName).Run() })
@@ -79,8 +76,8 @@ sleep 1
 	if logContent == "" {
 		t.Fatalf("stub did not write log file within 10s (marker check not executed)")
 	}
-	if logContent != "marker_found=true" {
-		t.Fatalf("child started before pending marker existed: %q", logContent)
+	if !strings.HasPrefix(logContent, "marker_found=true args=--session-id ") {
+		t.Fatalf("child started before pending marker existed, or without --session-id: %q", logContent)
 	}
 	entries, err := os.ReadDir(stateDir)
 	if err != nil {
@@ -100,38 +97,101 @@ sleep 1
 	if err != nil {
 		t.Fatal(err)
 	}
-	var marker dpmuxPendingMarker
+	var marker llmuxPendingMarker
 	if err := json.Unmarshal(markerData, &marker); err != nil || marker.SpawnInstant == 0 {
 		t.Fatalf("pending marker missing durable spawn instant: %v (%q)", err, markerData)
 	}
 	if marker.SpawnInstant > time.Now().UnixMilli() {
 		t.Fatalf("pending marker spawn instant %d is in the future", marker.SpawnInstant)
 	}
-	t.Log("✓ pending marker preceded devpass-code startup")
-
+	if !uuidRe.MatchString(marker.SessionID) {
+		t.Fatalf("pending marker carries no valid session id: %q", markerData)
+	}
+	if want := "marker_found=true args=--session-id " + marker.SessionID; logContent != want {
+		t.Fatalf("agent was launched with a different session id than the marker records:\n got: %q\nwant: %q", logContent, want)
+	}
+	t.Log("✓ pending marker (with the session id) preceded the agent startup")
 }
 
-// TestDpmux_MarkerBeforeSpawn_SystemdScope exercises the fresh-server birth
+// TestLlmux_ResumeMarker verifies `llmux --resume <uuid>` launches
+// `<agent> --resume <uuid>` and records the same id with resume=true, and that
+// a malformed id is refused before anything is launched.
+func TestLlmux_ResumeMarker(t *testing.T) {
+	mustBin(t, "tmux")
+	llmuxBin := mustBin(t, "llmux")
+	stateDir := llmuxStateDir(t)
+	logFile := filepath.Join(t.TempDir(), "resume-args.log")
+	stubScript := filepath.Join(t.TempDir(), "stub-agent")
+	stub := fmt.Sprintf("#!/bin/sh\nprintf '%%s %%s\\n' \"$1\" \"$2\" > %s\nsleep 1\n", shellQuoteForScript(logFile))
+	if err := os.WriteFile(stubScript, []byte(stub), 0755); err != nil {
+		t.Fatal(err)
+	}
+	env := append(os.Environ(), "RELAY_AGENT_CMD="+stubScript, "RELAY_STATE_DIR="+stateDir, "TMUX=")
+
+	bad := exec.Command(llmuxBin, "--resume", "not-a-uuid")
+	bad.Env = env
+	if out, err := bad.CombinedOutput(); err == nil {
+		t.Fatalf("llmux accepted a malformed session id: %s", out)
+	}
+	if entries, _ := os.ReadDir(stateDir); len(entries) != 0 {
+		t.Fatalf("a refused launch left state behind: %v", entries)
+	}
+
+	sid := testSID(60)
+	cmd := exec.Command(llmuxBin, "--resume", sid)
+	cmd.Env = env
+	var out strings.Builder
+	cmd.Stdout = &out
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("llmux --resume: %v", err)
+	}
+	name := strings.TrimSpace(out.String())
+	t.Cleanup(func() { _ = exec.Command("tmux", "kill-session", "-t", name).Run() })
+
+	deadline := time.Now().Add(10 * time.Second)
+	var got string
+	for time.Now().Before(deadline) && got == "" {
+		if data, err := os.ReadFile(logFile); err == nil {
+			got = strings.TrimSpace(string(data))
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got != "--resume "+sid {
+		t.Fatalf("agent args = %q, want %q", got, "--resume "+sid)
+	}
+	data, err := os.ReadFile(filepath.Join(stateDir, "pending-"+name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m struct {
+		SessionID string `json:"sessionID"`
+		Resume    bool   `json:"resume"`
+	}
+	if err := json.Unmarshal(data, &m); err != nil || m.SessionID != sid || !m.Resume {
+		t.Fatalf("resume marker = %q (err %v), want sessionID %s and resume=true", data, err, sid)
+	}
+	t.Log("✓ llmux --resume records the exact id with resume=true")
+}
+
+// TestLlmux_MarkerBeforeSpawn_SystemdScope exercises the fresh-server birth
 // path inside the user scope. The scope's manager environment is not the
-// dpmux process environment, so this is deliberately separate from the
+// llmux process environment, so this is deliberately separate from the
 // general marker ordering test: the child must see the exact state directory
 // containing its already-published marker.
-func TestDpmux_MarkerBeforeSpawn_SystemdScope(t *testing.T) {
+func TestLlmux_MarkerBeforeSpawn_SystemdScope(t *testing.T) {
 	mustBin(t, "tmux")
 	if systemdRun, err := exec.LookPath("systemd-run"); err != nil {
 		t.Skipf("systemd-run --user probe failed: %v", err)
 	} else if out, err := exec.Command(systemdRun, "--user", "--scope", "--collect", "true").CombinedOutput(); err != nil {
 		t.Skipf("systemd-run --user probe failed: %v: %s", err, strings.TrimSpace(string(out)))
 	}
-	dpmuxBin := mustBin(t, "dpmux")
-	stateDir := dpmuxStateDir(t)
+	llmuxBin := mustBin(t, "llmux")
+	stateDir := llmuxStateDir(t)
 	logFile := filepath.Join(t.TempDir(), "scope-marker-check.log")
 
-	stubScript := filepath.Join(t.TempDir(), "stub-devpass-code")
+	stubScript := filepath.Join(t.TempDir(), "stub-agent")
 	stubContent := fmt.Sprintf(`#!/bin/sh
-# dpmux probes RELAY_DEVPASS_BIN with -V/--version before it writes the marker;
-# that probe is not the spawned child and must not record marker state.
-case "$1" in -V|--version) exit 0 ;; esac
 marker_found=false
 for marker in "$RELAY_STATE_DIR"/pending-*; do
   if [ -e "$marker" ]; then marker_found=true; fi
@@ -143,20 +203,20 @@ sleep 1
 		t.Fatalf("write stub script: %v", err)
 	}
 
-	cmd := exec.Command(dpmuxBin)
+	cmd := exec.Command(llmuxBin)
 	var stdout, stderr strings.Builder
 	cmd.Env = append(os.Environ(),
-		fmt.Sprintf("RELAY_DEVPASS_BIN=%s", stubScript),
+		fmt.Sprintf("RELAY_AGENT_CMD=%s", stubScript),
 		fmt.Sprintf("RELAY_STATE_DIR=%s", stateDir),
 		"TMUX=",
 	)
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		t.Fatalf("dpmux scope launch: %v\n%s", err, stderr.String())
+		t.Fatalf("llmux scope launch: %v\n%s", err, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "tmux isolation mode: systemd-user-scope") {
-		t.Fatalf("dpmux did not use forced systemd scope: %s", stderr.String())
+		t.Fatalf("llmux did not use forced systemd scope: %s", stderr.String())
 	}
 	if sessionName := strings.TrimSpace(stdout.String()); sessionName != "" {
 		t.Cleanup(func() { _ = exec.Command("tmux", "kill-session", "-t", sessionName).Run() })
@@ -176,7 +236,7 @@ sleep 1
 	}
 	wantPrefix := "marker_found=true state_dir=" + stateDir + " home=" + os.Getenv("HOME")
 	if logContent != wantPrefix {
-		t.Fatalf("scope child did not inherit dpmux marker environment: got %q, want %q", logContent, wantPrefix)
+		t.Fatalf("scope child did not inherit llmux marker environment: got %q, want %q", logContent, wantPrefix)
 	}
 }
 
@@ -185,19 +245,19 @@ func shellQuoteForScript(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
-// TestDpmux_NewWindowMarkerBeforeSpawn verifies that dpmux writes the pending marker
+// TestLlmux_NewWindowMarkerBeforeSpawn verifies that llmux writes the pending marker
 // BEFORE running `tmux new-window` on the inside-pane (default-socket) path.
 //
 // Approach:
 //   - Start a real tmux session on the DEFAULT per-uid socket.
-//   - Run dpmux with TMUX set to look like the default socket, with a stub
-//     devpass-code that observes the marker at its own startup.
+//   - Run llmux with TMUX set to look like the default socket, with a stub
+//     the agent that observes the marker at its own startup.
 //   - Verify the marker was already present.
-func TestDpmux_NewWindowMarkerBeforeSpawn(t *testing.T) {
+func TestLlmux_NewWindowMarkerBeforeSpawn(t *testing.T) {
 	mustBin(t, "tmux")
-	dpmuxBin := mustBin(t, "dpmux")
+	llmuxBin := mustBin(t, "llmux")
 
-	stateDir := dpmuxStateDir(t)
+	stateDir := llmuxStateDir(t)
 	logFile := filepath.Join(t.TempDir(), "nw-marker-check.log")
 
 	// Create a host tmux session on the default socket.
@@ -224,12 +284,9 @@ func TestDpmux_NewWindowMarkerBeforeSpawn(t *testing.T) {
 	})
 
 	// Build a stub that records the durable marker state at its own startup.
-	stubScript := filepath.Join(t.TempDir(), "stub-devpass-code")
+	stubScript := filepath.Join(t.TempDir(), "stub-agent")
 	stubContent := fmt.Sprintf(`#!/bin/sh
-# Stub devpass-code: observe marker state before remaining alive.
-# dpmux probes RELAY_DEVPASS_BIN with -V/--version before it writes the marker;
-# that probe is not the spawned child and must not record marker state.
-case "$1" in -V|--version) exit 0 ;; esac
+# Stub agent: observe marker state before remaining alive.
 marker_found=false
 for marker in "%s"/pending-*; do
   if [ -e "$marker" ]; then marker_found=true; fi
@@ -248,12 +305,12 @@ sleep 1
 	fakeServerPID := "99999"
 	fakeTMUXEnv := defaultSocket + "," + fakeServerPID + ",0"
 
-	// Run dpmux as if inside the default socket.
-	cmd := exec.Command(dpmuxBin)
+	// Run llmux as if inside the default socket.
+	cmd := exec.Command(llmuxBin)
 	cmd.Env = append(os.Environ(),
-		fmt.Sprintf("RELAY_DEVPASS_BIN=%s", stubScript),
+		fmt.Sprintf("RELAY_AGENT_CMD=%s", stubScript),
 		fmt.Sprintf("RELAY_STATE_DIR=%s", stateDir),
-		// Set TMUX to look like we are inside the default socket so dpmux takes
+		// Set TMUX to look like we are inside the default socket so llmux takes
 		// the new-window path.  extractHostSessionName queries "tmux display-message -p #S"
 		// which will return the hostSession we created above.
 		fmt.Sprintf("TMUX=%s", fakeTMUXEnv),
@@ -262,9 +319,9 @@ sleep 1
 	cmd.Stdout = &outBuf
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		t.Logf("dpmux exit: %v", err)
+		t.Logf("llmux exit: %v", err)
 	}
-	t.Logf("dpmux stdout: %q", outBuf.String())
+	t.Logf("llmux stdout: %q", outBuf.String())
 
 	// Wait for the stub to write its log.
 	deadline := time.Now().Add(15 * time.Second)
@@ -298,14 +355,14 @@ sleep 1
 	if markerPath == "" {
 		t.Fatal("pending marker was absent while the new-window child was alive")
 	}
-	t.Log("✓ pending marker preceded devpass-code startup on new-window path")
+	t.Log("✓ pending marker preceded the agent startup on new-window path")
 
-	// Clean up dp-* tmux windows in the host session.
+	// Clean up llm-* tmux windows in the host session.
 	t.Cleanup(func() {
 		if out, err := exec.Command("tmux", "-L", "default", "list-windows",
 			"-t", hostSession, "-F", "#{window_name}").Output(); err == nil {
 			for _, w := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-				if strings.HasPrefix(w, "dp-") {
+				if strings.HasPrefix(w, "llm-") {
 					exec.Command("tmux", "-L", "default", "kill-window",
 						"-t", hostSession+":="+w).Run()
 				}
@@ -314,18 +371,18 @@ sleep 1
 	})
 }
 
-// dpmuxPendingMarker is the JSON structure of a pending marker file.
-type dpmuxPendingMarker struct {
+// llmuxPendingMarker is the JSON structure of a pending marker file.
+type llmuxPendingMarker struct {
 	Target       string `json:"target"`
-	Nonce        string `json:"nonce"`
+	SessionID    string `json:"sessionID"`
 	SpawnInstant int64  `json:"spawnInstant"`
 }
 
-// dpmuxStateDir stays outside /tmp because the scope used for a fresh tmux
+// llmuxStateDir stays outside /tmp because the scope used for a fresh tmux
 // birth has a private /tmp; /workspace is the shared integration-test mount.
-func dpmuxStateDir(t *testing.T) string {
+func llmuxStateDir(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("/workspace", "dpmux-marker-")
+	dir, err := os.MkdirTemp("/workspace", "llmux-marker-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,18 +390,18 @@ func dpmuxStateDir(t *testing.T) string {
 	return dir
 }
 
-// TestDpmux_ForeignSocketFallsBackToDefault verifies that when dpmux is invoked
+// TestLlmux_ForeignSocketFallsBackToDefault verifies that when llmux is invoked
 // with $TMUX pointing to a non-default tmux socket (a "foreign" socket), it
-// ignores that socket and creates the devpass-code session on the default
+// ignores that socket and creates the the agent session on the default
 // per-uid socket instead.
 //
 // Approach:
 //   - Start a second tmux server on socket name "relaytest" (-L relaytest).
 //   - Set TMUX to the relaytest socket path to simulate running inside a foreign socket.
-//   - Verify dpmux creates the new session on the DEFAULT socket (not relaytest).
-func TestDpmux_ForeignSocketFallsBackToDefault(t *testing.T) {
+//   - Verify llmux creates the new session on the DEFAULT socket (not relaytest).
+func TestLlmux_ForeignSocketFallsBackToDefault(t *testing.T) {
 	mustBin(t, "tmux")
-	dpmuxBin := mustBin(t, "dpmux")
+	llmuxBin := mustBin(t, "llmux")
 
 	stateDir := t.TempDir()
 
@@ -363,8 +420,8 @@ func TestDpmux_ForeignSocketFallsBackToDefault(t *testing.T) {
 	// tmux sockets are in /tmp/tmux-<uid>/ by default, named after "-L <name>".
 	relaytestSocket := fmt.Sprintf("/tmp/tmux-%d/relaytest", os.Getuid())
 
-	// Build a minimal stub devpass-code that exits immediately.
-	stubScript := filepath.Join(t.TempDir(), "stub-devpass-code")
+	// Build a minimal stub the agent that exits immediately.
+	stubScript := filepath.Join(t.TempDir(), "stub-agent")
 	stubContent := `#!/bin/sh
 # Minimal stub: just exit so tmux session ends quickly.
 sleep 1
@@ -377,25 +434,25 @@ sleep 1
 	fakeServerPID := "88888"
 	fakeTMUXEnv := relaytestSocket + "," + fakeServerPID + ",0"
 
-	// Run dpmux with TMUX pointing to the non-default relaytest socket.
-	cmd := exec.Command(dpmuxBin)
+	// Run llmux with TMUX pointing to the non-default relaytest socket.
+	cmd := exec.Command(llmuxBin)
 	var outBuf strings.Builder
 	cmd.Env = append(os.Environ(),
-		fmt.Sprintf("RELAY_DEVPASS_BIN=%s", stubScript),
+		fmt.Sprintf("RELAY_AGENT_CMD=%s", stubScript),
 		fmt.Sprintf("RELAY_STATE_DIR=%s", stateDir),
 		fmt.Sprintf("TMUX=%s", fakeTMUXEnv), // non-default socket
 	)
 	cmd.Stdout = &outBuf
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		t.Logf("dpmux exit: %v", err)
+		t.Logf("llmux exit: %v", err)
 	}
 
 	sessionName := strings.TrimSpace(outBuf.String())
 	if sessionName == "" {
-		t.Fatalf("dpmux produced no session name on stdout")
+		t.Fatalf("llmux produced no session name on stdout")
 	}
-	t.Logf("dpmux reported session: %q", sessionName)
+	t.Logf("llmux reported session: %q", sessionName)
 
 	t.Cleanup(func() {
 		exec.Command("tmux", "-L", "default", "kill-session", "-t", sessionName).Run()
@@ -405,7 +462,7 @@ sleep 1
 	// Verify the session was created on the DEFAULT socket, not relaytest.
 	defaultCheck := exec.Command("tmux", "-L", "default", "has-session", "-t", sessionName)
 	if err := defaultCheck.Run(); err != nil {
-		t.Errorf("session %q not found on default socket: dpmux may have created it on the wrong socket (err: %v)", sessionName, err)
+		t.Errorf("session %q not found on default socket: llmux may have created it on the wrong socket (err: %v)", sessionName, err)
 	} else {
 		t.Logf("✓ session %q exists on default socket", sessionName)
 	}
@@ -413,24 +470,24 @@ sleep 1
 	// Verify the session was NOT created on the relaytest socket.
 	relaytestCheck := exec.Command("tmux", "-L", "relaytest", "has-session", "-t", sessionName)
 	if relaytestCheck.Run() == nil {
-		t.Errorf("session %q found on relaytest socket; dpmux should have used the default socket for foreign-socket callers", sessionName)
+		t.Errorf("session %q found on relaytest socket; llmux should have used the default socket for foreign-socket callers", sessionName)
 	} else {
 		t.Logf("✓ session %q not on relaytest socket (correct)", sessionName)
 	}
 
-	// Verify the pending marker was written with a nonce.
+	// Verify the pending marker was written with the session id.
 	markerPath := filepath.Join(stateDir, "pending-"+sessionName)
 	markerData, err := os.ReadFile(markerPath)
 	if err != nil {
 		t.Logf("marker already cleaned up or not written: %v", err)
 	} else {
-		var m dpmuxPendingMarker
+		var m llmuxPendingMarker
 		if jsonErr := json.Unmarshal(markerData, &m); jsonErr != nil {
 			t.Errorf("pending marker is not valid JSON: %v (content: %q)", jsonErr, markerData)
-		} else if m.Nonce == "" {
-			t.Error("pending marker has empty nonce; nonce is required for session binding")
+		} else if !uuidRe.MatchString(m.SessionID) {
+			t.Error("pending marker has no valid session id; the id is required for session binding")
 		} else {
-			t.Logf("✓ pending marker nonce=%q target=%q", m.Nonce, m.Target)
+			t.Logf("✓ pending marker sessionID=%q target=%q", m.SessionID, m.Target)
 		}
 	}
 }

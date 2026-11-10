@@ -1,15 +1,14 @@
 [Unit]
-Description=DevPass Discord Relay
+Description=LLM Discord Relay
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 Environment=HOME=%h
-Environment=XDG_DATA_HOME=%h/.local/share
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-Environment=RELAY_DPMUX_BIN=%h/.local/bin/dpmux
-EnvironmentFile=-%h/.config/devpass-discord-relay/.env
+Environment=RELAY_LLMUX_BIN=%h/.local/bin/llmux
+EnvironmentFile=-%h/.config/llm-discord-relay/.env
 ExecStart=%h/.local/bin/relay
 Restart=on-failure
 RestartSec=5

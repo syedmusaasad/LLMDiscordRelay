@@ -39,6 +39,15 @@ func TestSendShapeAndDailyOnce(t *testing.T) {
 	if got != `{"username":"`+want+`","version":"v1"}` {
 		t.Fatalf("body = %s", got)
 	}
+	// The stamp is written after the response; wait for it so the second Send
+	// cannot race the first one's bookkeeping.
+	stampDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(stampDeadline) {
+		if _, err := os.Stat(dir + "/telemetry-last-date"); err == nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
 	Send(dir, "v1", s.URL)
 	time.Sleep(20 * time.Millisecond)
 	if calls.Load() != 1 {

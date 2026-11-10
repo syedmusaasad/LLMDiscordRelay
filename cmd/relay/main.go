@@ -1,25 +1,27 @@
-// cmd/relay: main entry point for the devpass-discord relay.
+// cmd/relay: main entry point for the LLMDiscordRelay.
 //
 // Configuration via .env file resolved:
 //
-//	$DEVPASS_RELAY_ENV → ~/.config/devpass-discord-relay/.env → ./.env
+//	$LLM_RELAY_ENV → ~/.config/llm-discord-relay/.env → ./.env
 //
 // Required env vars:
 //
 //	DISCORD_TOKEN       Bot token
 //	DISCORD_CHANNEL_ID  Channel to post session threads into
+//	DISCORD_USER_ID     The one Discord user whose messages are honoured
 //
 // Optional env vars:
 //
-//	RELAY_DEVPASS_DB    Path to opencode.db (default: $XDG_DATA_HOME/devpass-code/opencode.db)
-//	RELAY_STATE_DIR     State dir (default: ~/.devpass-discord-relay)
+//	RELAY_CLAUDE_PROJECTS  Claude Code projects dir (default: $CLAUDE_CONFIG_DIR/projects, else ~/.claude/projects)
+//	RELAY_STATE_DIR     State dir (default: ~/.llm-discord-relay)
+//	RELAY_LLMUX_BIN     Path to the llmux binary (default: llmux on PATH)
+//	RELAY_AGENT_CMD     Agent command llmux runs (default: claude)
 //	DISCORD_API_URL     Override Discord API URL (for testing)
 //	APPROVAL_TIMEOUT_SECONDS  Auto-deny timeout for pane permission prompts (default 300)
 package main
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log"
 	"os"
@@ -31,10 +33,10 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/devpass/devpass-discord-relay/internal/mirror"
-	"github.com/devpass/devpass-discord-relay/internal/telemetry"
-	"github.com/devpass/devpass-discord-relay/internal/tmuxctl"
-	_ "modernc.org/sqlite"
+	"github.com/syedmusaasad/LLMDiscordRelay/internal/mirror"
+	"github.com/syedmusaasad/LLMDiscordRelay/internal/telemetry"
+	"github.com/syedmusaasad/LLMDiscordRelay/internal/tmuxctl"
+	"github.com/syedmusaasad/LLMDiscordRelay/internal/transcript"
 )
 
 func main() {
@@ -66,7 +68,7 @@ func runRelay(ctx context.Context) error {
 		return fmt.Errorf("DISCORD_USER_ID must be set: refusing to start without a single allowed Discord user")
 	}
 
-	dbPath, err := resolveDBPath()
+	projectsRoot, err := transcript.DefaultRoot()
 	if err != nil {
 		return err
 	}
@@ -78,14 +80,6 @@ func runRelay(ctx context.Context) error {
 	if err := os.MkdirAll(stateDir, 0755); err != nil {
 		return fmt.Errorf("mkdir state dir: %w", err)
 	}
-
-	// Open the DB read-only via sqlite URI
-	dsn := fmt.Sprintf("file:%s?mode=ro", dbPath)
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return fmt.Errorf("open db %s: %w", dbPath, err)
-	}
-	defer db.Close()
 
 	// Create Discord client
 	apiURL := os.Getenv("DISCORD_API_URL")
@@ -99,9 +93,9 @@ func runRelay(ctx context.Context) error {
 		DiscordAPIURL: apiURL,
 		ChannelID:     channelID,
 		AllowedUserID: userID,
-		DBPath:        dbPath,
+		ProjectsRoot:  projectsRoot,
 		StateDir:      stateDir,
-		DpmuxBin:      os.Getenv("RELAY_DPMUX_BIN"), // optional override for dpmux binary path
+		LlmuxBin:      os.Getenv("RELAY_LLMUX_BIN"), // optional override for llmux binary path
 	}
 	if v := os.Getenv("SESSION_TTL_DAYS"); v != "" {
 		if days, parseErr := strconv.Atoi(v); parseErr == nil && days > 0 {
@@ -120,7 +114,7 @@ func runRelay(ctx context.Context) error {
 		}
 	}
 
-	w, err := mirror.NewWatcher(cfg, db, dc)
+	w, err := mirror.NewWatcher(cfg, dc)
 	if err != nil {
 		return fmt.Errorf("watcher: %w", err)
 	}
@@ -344,16 +338,28 @@ func discordComponents(components []mirror.Component) []discordgo.MessageCompone
 // ── Config helpers ─────────────────────────────────────────────────────────────
 
 // loadEnv loads a .env file. Resolution order:
-// 1. $DEVPASS_RELAY_ENV
-// 2. ~/.config/devpass-discord-relay/.env
-// 3. ./.env
+//  1. $LLM_RELAY_ENV
+//  2. ~/.config/llm-discord-relay/.env (seeded from the pre-1.0 config directory
+//     when it does not exist yet; see migrateLegacyEnv)
+//  3. ./.env
 func loadEnv() error {
 	var paths []string
-	if v := os.Getenv("DEVPASS_RELAY_ENV"); v != "" {
+	if v := os.Getenv("LLM_RELAY_ENV"); v != "" {
+		// An explicitly named file wins; when it loads, nothing under the
+		// home directory is read or migrated (isolated runs must not touch it).
+		if err := readDotEnv(v); err == nil {
+			return nil
+		}
 		paths = append(paths, v)
 	}
 	if home, err := os.UserHomeDir(); err == nil {
-		paths = append(paths, filepath.Join(home, ".config", "devpass-discord-relay", ".env"))
+		current := filepath.Join(home, ".config", configDirName, ".env")
+		if migrated, err := migrateLegacyEnv(home); err != nil {
+			log.Printf("relay: migrate previous config: %v", err)
+		} else if migrated {
+			log.Printf("relay: copied %s to %s (the previous file was left in place)", legacyEnvPath(home), current)
+		}
+		paths = append(paths, current)
 	}
 	paths = append(paths, ".env")
 
@@ -394,22 +400,6 @@ func readDotEnv(path string) error {
 	return nil
 }
 
-// resolveDBPath returns the opencode.db path.
-func resolveDBPath() (string, error) {
-	if v := os.Getenv("RELAY_DEVPASS_DB"); v != "" {
-		return v, nil
-	}
-	xdg := os.Getenv("XDG_DATA_HOME")
-	if xdg == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", fmt.Errorf("home dir: %w", err)
-		}
-		xdg = filepath.Join(home, ".local", "share")
-	}
-	return filepath.Join(xdg, "devpass-code", "opencode.db"), nil
-}
-
 // resolveStateDir returns the relay state directory.
 func resolveStateDir() (string, error) {
 	if v := os.Getenv("RELAY_STATE_DIR"); v != "" {
@@ -419,5 +409,5 @@ func resolveStateDir() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("home dir: %w", err)
 	}
-	return filepath.Join(home, ".devpass-discord-relay"), nil
+	return filepath.Join(home, ".llm-discord-relay"), nil
 }

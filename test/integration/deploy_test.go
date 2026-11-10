@@ -66,12 +66,12 @@ func TestRelay_RefusesWithoutUserID(t *testing.T) {
 	}
 }
 
-// TestInstalledUnit_ResolvesDpmux installs into a temp HOME through install.sh,
+// TestInstalledUnit_ResolvesLlmux installs into a temp HOME through install.sh,
 // then runs the installed relay with exactly the unit's Environment lines and a
 // minimal PATH (/usr/bin:/bin, no ~/.local/bin) under a disposable
-// systemd-run --user unit. A spawn must still reach the installed dpmux, which
-// is only possible through the unit's RELAY_DPMUX_BIN.
-func TestInstalledUnit_ResolvesDpmux(t *testing.T) {
+// systemd-run --user unit. A spawn must still reach the installed llmux, which
+// is only possible through the unit's RELAY_LLMUX_BIN.
+func TestInstalledUnit_ResolvesLlmux(t *testing.T) {
 	systemdRun, err := exec.LookPath("systemd-run")
 	if err != nil {
 		t.Skipf("systemd-run --user unavailable: probe failed: %v", err)
@@ -79,19 +79,19 @@ func TestInstalledUnit_ResolvesDpmux(t *testing.T) {
 	if out, err := exec.Command("systemctl", "--user", "show-environment").CombinedOutput(); err != nil {
 		t.Skipf("systemd-run --user unavailable: probe failed: %v: %s", err, out)
 	}
-	relayBin, mockDS, fakeBin := mustBin(t, "relay"), mustBin(t, "mock-discord"), mustBin(t, "fake-devpass-code")
+	relayBin, mockDS := mustBin(t, "relay"), mustBin(t, "mock-discord")
 	repo, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)
 	}
-	unitSrc := filepath.Join(repo, "systemd", "devpass-discord-relay.service")
+	unitSrc := filepath.Join(repo, "systemd", "llm-discord-relay.service")
 	installSh := filepath.Join(repo, "install.sh")
 
 	home, state, srcBin := t.TempDir(), t.TempDir(), t.TempDir()
-	ranMarker := filepath.Join(state, "stub-dpmux-ran")
-	// Stub dpmux: proves the installed path was executed without starting a CLI.
-	stub := fmt.Sprintf("#!/bin/sh\necho \"$0\" > %q\necho dp-stub\n", ranMarker)
-	if err := os.WriteFile(filepath.Join(srcBin, "dpmux"), []byte(stub), 0755); err != nil {
+	ranMarker := filepath.Join(state, "stub-llmux-ran")
+	// Stub llmux: proves the installed path was executed without starting a CLI.
+	stub := fmt.Sprintf("#!/bin/sh\necho \"$0\" > %q\necho llm-stub\n", ranMarker)
+	if err := os.WriteFile(filepath.Join(srcBin, "llmux"), []byte(stub), 0755); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(relayBin)
@@ -109,14 +109,14 @@ func TestInstalledUnit_ResolvesDpmux(t *testing.T) {
 	if out, err := inst.CombinedOutput(); err != nil {
 		t.Fatalf("install.sh: %v\n%s", err, out)
 	}
-	installedDpmux := filepath.Join(home, ".local", "bin", "dpmux")
-	installedUnit := filepath.Join(home, ".config", "systemd", "user", "devpass-discord-relay.service")
+	installedLlmux := filepath.Join(home, ".local", "bin", "llmux")
+	installedUnit := filepath.Join(home, ".config", "systemd", "user", "llm-discord-relay.service")
 	unitBytes, err := os.ReadFile(installedUnit)
 	if err != nil {
 		t.Fatalf("install.sh did not install the unit: %v", err)
 	}
 	if orig, _ := os.ReadFile(unitSrc); !bytes.Equal(orig, unitBytes) {
-		t.Fatal("installed unit differs from systemd/devpass-discord-relay.service")
+		t.Fatal("installed unit differs from systemd/llm-discord-relay.service")
 	}
 
 	// Take the unit's Environment lines and ExecStart verbatim (with %h expanded).
@@ -134,21 +134,14 @@ func TestInstalledUnit_ResolvesDpmux(t *testing.T) {
 			execStart = strings.TrimPrefix(line, "ExecStart=")
 		}
 	}
-	if unitEnv["RELAY_DPMUX_BIN"] != installedDpmux {
-		t.Fatalf("unit RELAY_DPMUX_BIN = %q, want %q", unitEnv["RELAY_DPMUX_BIN"], installedDpmux)
+	if unitEnv["RELAY_LLMUX_BIN"] != installedLlmux {
+		t.Fatalf("unit RELAY_LLMUX_BIN = %q, want %q", unitEnv["RELAY_LLMUX_BIN"], installedLlmux)
 	}
 	if execStart != filepath.Join(home, ".local", "bin", "relay") {
 		t.Fatalf("unit ExecStart = %q", execStart)
 	}
 	// Minimal PATH: the user manager's default, without ~/.local/bin.
 	unitEnv["PATH"] = "/usr/bin:/bin"
-
-	// Seed the DB at the unit's XDG_DATA_HOME so the read-only open succeeds.
-	seed := exec.Command(fakeBin, "--auto")
-	seed.Env = append(os.Environ(), "XDG_DATA_HOME="+unitEnv["XDG_DATA_HOME"])
-	if out, err := seed.CombinedOutput(); err != nil {
-		t.Fatalf("seed relay DB: %v\n%s", err, out)
-	}
 
 	port, gwPort := "19938", "19939"
 	startMockDiscord(t, mockDS, port, gwPort)
@@ -180,8 +173,8 @@ func TestInstalledUnit_ResolvesDpmux(t *testing.T) {
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if b, err := os.ReadFile(ranMarker); err == nil {
-			if got := strings.TrimSpace(string(b)); got != installedDpmux {
-				t.Fatalf("stub ran as %q, want installed path %q", got, installedDpmux)
+			if got := strings.TrimSpace(string(b)); got != installedLlmux {
+				t.Fatalf("stub ran as %q, want installed path %q", got, installedLlmux)
 			}
 			return
 		}
@@ -189,5 +182,5 @@ func TestInstalledUnit_ResolvesDpmux(t *testing.T) {
 	}
 	logData, _ := os.ReadFile(relayLog)
 	status, _ := exec.Command("systemctl", "--user", "status", unit, "--no-pager").CombinedOutput()
-	t.Fatalf("installed dpmux never ran under minimal PATH\nunit:\n%s\nrelay log:\n%s", status, logData)
+	t.Fatalf("installed llmux never ran under minimal PATH\nunit:\n%s\nrelay log:\n%s", status, logData)
 }

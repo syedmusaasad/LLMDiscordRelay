@@ -1,6 +1,26 @@
 # Changelog
 
-Release history for DevPassDiscordRelay.
+Release history for LLMDiscordRelay.
+
+## [1.0.0] - 2026-11-08
+
+### Changed
+- Renamed project from DevPassDiscordRelay to LLMDiscordRelay.
+- Added Claude Code session monitoring and interaction inside tmux.
+- Renamed terminal launcher to `llmux`, supporting `llmux [args...]`, `llmux ls`, and `llmux --resume <id>`.
+- Configured agent execution via `RELAY_AGENT_CMD` (defaults to `claude`; configurable to `pl` or other agents).
+- Migrated transcript persistence from SQLite (`opencode.db`) to Claude Code JSONL transcripts in `$CLAUDE_CONFIG_DIR/projects/<slug>/<session-id>.jsonl`.
+- Updated environment variable prefixes from `DEVPASS_*` / `RELAY_DEVPASS_*` to `LLM_RELAY_*` and `RELAY_AGENT_*`.
+- Moved configuration directory to `~/.config/llm-discord-relay/` and state directory to `~/.llm-discord-relay/`.
+- Added automatic configuration migration: an existing `~/.config/devpass-discord-relay/.env` is copied to `~/.config/llm-discord-relay/.env` on first startup if missing, leaving the original intact.
+- Replaced stderr-log binding with pre-allocated UUIDv4 session identifiers and pending marker pairing.
+- Added interactive approval support for directory trust checks ("Quick safety check") and tool permission prompts.
+- Added AskUserQuestion option picker support with interactive Discord selections.
+- Added bracketed paste support via tmux buffers for reliable multi-line input submission.
+
+### Removed
+- Removed devpass-code support and SQLite transcript tailing.
+- Removed `dpmux` launcher binary and legacy `DEVPASS_*` environment variables.
 
 ## [0.1.0] - 2026-09-30
 

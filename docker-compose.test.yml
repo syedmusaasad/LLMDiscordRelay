@@ -1,11 +1,11 @@
-name: devpass-discord-relay-test
+name: llm-discord-relay-test
 
 services:
   test:
     build:
       context: .
       dockerfile: Dockerfile.test
-    image: devpass-discord-relay-test:latest
+    image: llm-discord-relay-test:latest
     # Throwaway HOME; never mounts developer HOME
     environment:
       - HOME=/home/testuser

@@ -1,16 +1,20 @@
-// cmd/dpmux: launch devpass-code in a named tmux session and multiplex its I/O.
+// cmd/llmux: launch Claude Code in a named tmux session so the relay can mirror it.
 //
 // Usage:
 //
-//	dpmux [args...]         — launch a new session with auto-generated name dp-<unixtime>-<pid>
-//	dpmux ls                — list active relay sessions
+//	llmux [args...]         — launch a new session named llm-<unixtime>-<pid>
+//	llmux --resume <uuid>   — resume an existing Claude Code session
+//	llmux ls                — list active relay sessions
+//	llmux update            — update to the latest release
+//	llmux uninstall         — remove the installed relay
 //
-// Session name: dp-<unixtime>-<pid>
-// Passes --auto to devpass-code unless --untrusted appears anywhere in args.
-// Writes ~/.devpass-discord-relay/pending-<session-name> as JSON containing
-// the tmux target, a nonce, and the spawn instant.  The nonce is also passed
-// to devpass-code via RELAY_SPAWN_NONCE so it lands in the session row's title
-// column, allowing the relay to prove the binding is its own.
+// A new session is `claude --session-id <uuid>` with a uuid4 chosen here; a
+// resume is `claude --resume <uuid>`. llmux writes
+// <state dir>/pending-<session-name> as JSON containing the tmux target, the
+// spawn instant and that session id BEFORE the process starts. Claude Code
+// creates the transcript only when the first prompt is submitted; the relay
+// pairs the marker with the transcript of exactly that id (see
+// docs/BINDING-PROTOCOL.md).
 //
 // Inside-pane detection:
 //   - If we are already inside a pane on the DEFAULT per-uid socket
@@ -21,9 +25,14 @@
 //
 // Env overrides:
 //
-//	RELAY_DEVPASS_BIN  path to devpass-code binary (default: "devpass-code" on PATH)
-//	RELAY_DEVPASS_DB   path to opencode.db (default: $XDG_DATA_HOME/devpass-code/opencode.db)
-//	RELAY_STATE_DIR    state dir (default: ~/.devpass-discord-relay)
+//	RELAY_AGENT_CMD        agent command, split on whitespace; the first word is
+//	                       resolved on PATH (default: "claude"; e.g. "pl")
+//	RELAY_STATE_DIR        state dir (default: ~/.llm-discord-relay)
+//	RELAY_CLAUDE_PROJECTS  Claude Code projects dir (forwarded to the agent
+//	                       process; the relay reads transcripts from it)
+//	RELAY_MARKER_OWNER     recorded in the pending marker as "owner"; the relay's
+//	                       own spawn paths set it so its marker scanner never
+//	                       claims their markers
 package main
 
 import (
@@ -34,15 +43,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
-	"github.com/devpass/devpass-discord-relay/internal/tmuxctl"
+	"github.com/syedmusaasad/LLMDiscordRelay/internal/tmuxctl"
+	"github.com/syedmusaasad/LLMDiscordRelay/internal/transcript"
 )
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "dpmux:", err)
+		fmt.Fprintln(os.Stderr, "llmux:", err)
 		os.Exit(1)
 	}
 }
@@ -102,7 +113,7 @@ func installUpdatedBinaries(root string) error {
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		return err
 	}
-	for _, name := range []string{"relay", "dpmux"} {
+	for _, name := range []string{"relay", "llmux"} {
 		data, err := os.ReadFile(filepath.Join(root, "bin", name))
 		if err != nil {
 			return fmt.Errorf("read rebuilt %s: %w", name, err)
@@ -159,7 +170,7 @@ func updateSource() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	marker := filepath.Join(home, ".config", "devpass-discord-relay", "install-source")
+	marker := filepath.Join(home, ".config", "llm-discord-relay", "install-source")
 	if data, readErr := os.ReadFile(marker); readErr == nil {
 		root := strings.TrimSpace(string(data))
 		if root != "" {
@@ -168,12 +179,12 @@ func updateSource() (string, error) {
 			}
 		}
 	}
-	root := filepath.Join(home, ".cache", "devpass-discord-relay", "source")
+	root := filepath.Join(home, ".cache", "llm-discord-relay", "source")
 	if _, statErr := os.Stat(filepath.Join(root, ".git")); statErr != nil {
 		if err := os.MkdirAll(filepath.Dir(root), 0755); err != nil {
 			return "", err
 		}
-		cmd := exec.Command("git", "clone", "https://github.com/syedmusaasad/DevPassDiscordRelay.git", root)
+		cmd := exec.Command("git", "clone", "https://github.com/syedmusaasad/LLMDiscordRelay.git", root)
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 		if err := cmd.Run(); err != nil {
 			return "", fmt.Errorf("clone update source: %w", err)
@@ -183,7 +194,7 @@ func updateSource() (string, error) {
 }
 
 func promptRestart() {
-	const instruction = "Update complete. Restart with: systemctl --user restart devpass-discord-relay"
+	const instruction = "Update complete. Restart with: systemctl --user restart llm-discord-relay"
 	info, err := os.Stdin.Stat()
 	if err != nil || info.Mode()&os.ModeCharDevice == 0 {
 		fmt.Fprintln(os.Stderr, instruction)
@@ -193,7 +204,7 @@ func promptRestart() {
 	var answer string
 	_, _ = fmt.Fscanln(os.Stdin, &answer)
 	if strings.EqualFold(answer, "y") || strings.EqualFold(answer, "yes") {
-		_ = exec.Command("systemctl", "--user", "restart", "devpass-discord-relay").Run()
+		_ = exec.Command("systemctl", "--user", "restart", "llm-discord-relay").Run()
 	}
 }
 
@@ -202,7 +213,7 @@ func runUninstall() error {
 	if err != nil {
 		return err
 	}
-	configDir := filepath.Join(home, ".config", "devpass-discord-relay")
+	configDir := filepath.Join(home, ".config", "llm-discord-relay")
 	envPath := filepath.Join(configDir, ".env")
 	if data, err := os.ReadFile(envPath); err == nil {
 		backup := envPath + ".uninstall.bak"
@@ -210,10 +221,10 @@ func runUninstall() error {
 			return fmt.Errorf("backup .env: %w", err)
 		}
 	}
-	_ = exec.Command("systemctl", "--user", "disable", "--now", "devpass-discord-relay.service").Run()
-	_ = os.Remove(filepath.Join(home, ".config", "systemd", "user", "devpass-discord-relay.service"))
+	_ = exec.Command("systemctl", "--user", "disable", "--now", "llm-discord-relay.service").Run()
+	_ = os.Remove(filepath.Join(home, ".config", "systemd", "user", "llm-discord-relay.service"))
 	_ = os.Remove(filepath.Join(home, ".local", "bin", "relay"))
-	_ = os.Remove(filepath.Join(home, ".local", "bin", "dpmux"))
+	_ = os.Remove(filepath.Join(home, ".local", "bin", "llmux"))
 	_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
 	fmt.Fprintln(os.Stderr, "Uninstalled; .env backup retained at "+envPath+".uninstall.bak")
 	return nil
@@ -228,10 +239,10 @@ func repoRoot() (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// runLS lists active relay (dp-*) sessions and their windows.
+// runLS lists active relay (llm-*) sessions and their windows.
 // Window lines that duplicate their session name are suppressed.
 func runLS() error {
-	// List all sessions, filter to dp-* only.
+	// List all sessions, filter to llm-* only.
 	tmuxBin, err := tmuxctl.ResolveTmuxBin()
 	if err != nil {
 		return err
@@ -241,20 +252,20 @@ func runLS() error {
 		// No sessions running is OK.
 		return nil
 	}
-	var dpSessions []string
+	var llmSessions []string
 	for _, line := range strings.Split(strings.TrimSpace(string(sessOut)), "\n") {
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "dp-") {
-			dpSessions = append(dpSessions, line)
+		if strings.HasPrefix(line, "llm-") {
+			llmSessions = append(llmSessions, line)
 		}
 	}
-	if len(dpSessions) == 0 {
+	if len(llmSessions) == 0 {
 		return nil
 	}
 
-	for _, sess := range dpSessions {
+	for _, sess := range llmSessions {
 		fmt.Println(sess)
 		// List windows for this session; suppress windows whose name equals the session name.
 		winOut, err := exec.Command(tmuxBin, "list-windows", "-t", sess, "-F", "#{window_name}").Output()
@@ -272,35 +283,66 @@ func runLS() error {
 }
 
 // pendingMarker is the JSON written to pending-<session-name> in stateDir.
-// The relay reads this to bind the session row to the spawn.
-//
-// StderrLog is the phase-16-verified identity evidence: devpass-code is launched
-// with --print-logs --log-level INFO and its stderr is redirected to this unique,
-// per-pane file.  When devpass-code creates a new session row, it writes
-// "message=created id=ses_<ID>" to stderr.  Because this file is exclusive to
-// this one launched process, it is mechanically impossible for a foreign
-// process's session id to appear in it.  This is the sole production identity
-// mechanism (see docs/BINDING-PROTOCOL.md); Nonce is retained only for legacy
-// marker-format compatibility and is not used to prove ownership.
+// The relay reads this to pair the launch with its transcript. The session id
+// is chosen by llmux (claude --session-id / --resume), so the marker carries the
+// identity directly and nothing has to be inferred later.
 type pendingMarker struct {
-	Target       string `json:"target"`              // tmux target (e.g. "dp-123:0.0")
-	Nonce        string `json:"nonce"`               // legacy; not used for production identity
-	SpawnInstant int64  `json:"spawnInstant"`        // time.Now().UnixMilli() when marker was written
-	StderrLog    string `json:"stderrLog"`           // path to this launch's exclusive stderr log file
-	SessionID    string `json:"sessionID,omitempty"` // exact historical ID for a --session resume
+	Target       string `json:"target"`           // tmux target (e.g. "llm-123:0.0")
+	SpawnInstant int64  `json:"spawnInstant"`     // time.Now().UnixMilli() when marker was written
+	SessionID    string `json:"sessionID"`        // Claude Code session id of this launch
+	Resume       bool   `json:"resume,omitempty"` // true for `--resume <id>`: the transcript already exists
+	Owner        string `json:"owner,omitempty"`  // $RELAY_MARKER_OWNER: set when the relay's own spawn path owns the marker; the scanner never claims it
 }
 
-// generateNonce returns 16 random hex bytes.
-func generateNonce() string {
+// launchPlan is what llmux will run for one invocation.
+type launchPlan struct {
+	SessionID string
+	Resume    bool
+	Args      []string // arguments for the agent, identity flag first
+}
+
+// newSessionID returns a random RFC 4122 version-4 UUID.
+func newSessionID() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		// Fallback: use time-based value (should not occur in practice).
-		return fmt.Sprintf("%x", time.Now().UnixNano())
+		panic(fmt.Sprintf("llmux: no randomness: %v", err))
 	}
-	return hex.EncodeToString(b)
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	h := hex.EncodeToString(b)
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
 }
 
-// runLaunch launches a new devpass-code session.
+// planLaunch turns llmux's arguments into the agent arguments. `--resume <uuid>`
+// resumes; anything else is passed through to a new `--session-id <uuid>` launch.
+func planLaunch(args []string, newID func() string) (launchPlan, error) {
+	var rest []string
+	resumeID := ""
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--resume" || args[i] == "-r":
+			if i+1 >= len(args) {
+				return launchPlan{}, fmt.Errorf("--resume needs a session id")
+			}
+			i++
+			resumeID = args[i]
+		case strings.HasPrefix(args[i], "--resume="):
+			resumeID = strings.TrimPrefix(args[i], "--resume=")
+		default:
+			rest = append(rest, args[i])
+		}
+	}
+	if resumeID != "" {
+		if !transcript.ValidSessionID(resumeID) {
+			return launchPlan{}, fmt.Errorf("invalid session id %q (want a UUID)", resumeID)
+		}
+		return launchPlan{SessionID: resumeID, Resume: true, Args: append([]string{"--resume", resumeID}, rest...)}, nil
+	}
+	id := newID()
+	return launchPlan{SessionID: id, Args: append([]string{"--session-id", id}, rest...)}, nil
+}
+
+// runLaunch launches a new (or resumed) Claude Code session.
 func runLaunch(args []string) error {
 	stateDir, err := resolveStateDir()
 	if err != nil {
@@ -309,14 +351,17 @@ func runLaunch(args []string) error {
 	if err := os.MkdirAll(stateDir, 0755); err != nil {
 		return fmt.Errorf("mkdir state dir: %w", err)
 	}
+	plan, err := planLaunch(args, newSessionID)
+	if err != nil {
+		return err
+	}
 
 	// Auto-generate session name
 	now := time.Now().UnixMilli()
 	pid := os.Getpid()
-	sessionName := fmt.Sprintf("dp-%d-%d", now, pid)
+	sessionName := fmt.Sprintf("llm-%d-%d", now, pid)
 
-	// Determine the devpass-code binary
-	devpassBin, err := resolveDevpassBin()
+	agent, err := resolveAgentCmd()
 	if err != nil {
 		return err
 	}
@@ -324,37 +369,7 @@ func runLaunch(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "[dpmux] tmux isolation mode: %s\n", tmuxctl.IsolationMode())
-
-	// Build command args for devpass-code
-	dpArgs := []string{}
-	untrusted := false
-	for _, a := range args {
-		if a == "--untrusted" {
-			untrusted = true
-		} else {
-			dpArgs = append(dpArgs, a)
-		}
-	}
-	if !untrusted {
-		dpArgs = append([]string{"--auto"}, dpArgs...)
-	}
-	// New relay-triggered conversations must not inherit a prior CLI session.
-	// `--auto` alone may resume the most recent row, which is not a spawn.
-	if resumeSessionID := sessionIDFromArgs(dpArgs); resumeSessionID == "" && os.Getenv("RELAY_NEW_SESSION") == "1" {
-		os.Setenv("FAKE_DP_FORCE_NEW_SESSION", "1")
-	}
-	resumeSessionID := sessionIDFromArgs(dpArgs)
-
-	// Generate a nonce (legacy marker field only; not used to prove identity).
-	nonce := generateNonce()
-
-	// stderrLog is this launch's exclusive identity-evidence file (phase-16
-	// verified protocol): devpass-code is launched with --print-logs
-	// --log-level INFO and its stderr is redirected here.  When the session
-	// row is created, devpass-code logs "message=created id=ses_<ID>" to this
-	// file, which no other process can write to.
-	stderrLog := filepath.Join(stateDir, "stderr-"+sessionName+".log")
+	fmt.Fprintf(os.Stderr, "[llmux] tmux isolation mode: %s\n", tmuxctl.IsolationMode())
 
 	// Detect if we're inside a tmux pane on the DEFAULT per-uid socket.
 	// The TMUX env var format is: <socket-path>,<server-pid>,<window-index>
@@ -375,25 +390,25 @@ func runLaunch(args []string) error {
 			tmuxTarget = hostSessionName + ":=" + windowName
 
 			// Write the pending marker BEFORE spawning so the relay can pair
-			// the session even if devpass-code creates the DB row immediately.
+			// the session as soon as its first prompt creates the transcript.
 			pendingPath := filepath.Join(stateDir, "pending-"+sessionName)
 			marker := pendingMarker{
 				Target:       tmuxTarget,
-				Nonce:        nonce,
 				SpawnInstant: time.Now().UnixMilli(),
-				StderrLog:    stderrLog,
-				SessionID:    resumeSessionID,
+				SessionID:    plan.SessionID,
+				Resume:       plan.Resume,
+				Owner:        os.Getenv("RELAY_MARKER_OWNER"),
 			}
 			if err := writePendingMarker(pendingPath, marker); err != nil {
 				return fmt.Errorf("write pending marker: %w", err)
 			}
 
-			launchCmd := buildDevpassCmd(devpassBin, dpArgs, nonce, stderrLog)
+			launchCmd := buildAgentCmd(agent, plan.Args)
 			launch, _ := tmuxctl.NewBirthCommand(tmuxBin, "new-window", "-t", hostSessionName, "-n", windowName,
 				"-d", launchCmd)
 			launchErr := launch.Run()
 			if launchErr == nil {
-				fmt.Fprintf(os.Stderr, "[dpmux] session %q started, target=%s\n", sessionName, tmuxTarget)
+				fmt.Fprintf(os.Stderr, "[llmux] session %q started, target=%s\n", sessionName, tmuxTarget)
 				fmt.Println(sessionName)
 				return nil
 			}
@@ -413,10 +428,10 @@ func runLaunch(args []string) error {
 	pendingPath := filepath.Join(stateDir, "pending-"+sessionName)
 	marker := pendingMarker{
 		Target:       tmuxTarget,
-		Nonce:        nonce,
 		SpawnInstant: time.Now().UnixMilli(),
-		StderrLog:    stderrLog,
-		SessionID:    resumeSessionID,
+		SessionID:    plan.SessionID,
+		Resume:       plan.Resume,
+		Owner:        os.Getenv("RELAY_MARKER_OWNER"),
 	}
 	if err := writePendingMarker(pendingPath, marker); err != nil {
 		return fmt.Errorf("write pending marker: %w", err)
@@ -425,7 +440,7 @@ func runLaunch(args []string) error {
 		return fmt.Errorf("verify pending marker: %w", err)
 	}
 
-	launchCmd := buildDevpassCmd(devpassBin, dpArgs, nonce, stderrLog)
+	launchCmd := buildAgentCmd(agent, plan.Args)
 	// Select the default socket explicitly. Merely clearing the client identity
 	// is insufficient: tmux can still derive a foreign socket from the inherited
 	// client environment. -L default continues to honor TMUX_TMPDIR.
@@ -437,7 +452,7 @@ func runLaunch(args []string) error {
 		return fmt.Errorf("tmux new-session: %w", launchErr)
 	}
 
-	fmt.Fprintf(os.Stderr, "[dpmux] session %q started, target=%s\n", sessionName, tmuxTarget)
+	fmt.Fprintf(os.Stderr, "[llmux] session %q started, target=%s\n", sessionName, tmuxTarget)
 	fmt.Println(sessionName)
 	return nil
 }
@@ -487,76 +502,51 @@ func writePendingMarker(path string, marker pendingMarker) error {
 	return dir.Sync()
 }
 
-// sessionIDFromArgs returns the exact historical id requested by a resume.
-// Unlike a new spawn, a resume does not create a session row or emit the
-// creation log, so the explicit --session identity is retained in the marker.
-func sessionIDFromArgs(args []string) string {
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] == "--session" || args[i] == "-s" {
-			return args[i+1]
-		}
-	}
-	return ""
+// forwardedEnv are the variables copied into the agent's command line (the
+// tmux server's stored environment may be stale), besides FAKE_CLAUDE_* knobs.
+var forwardedEnv = []string{
+	"RELAY_STATE_DIR",
+	"RELAY_CLAUDE_PROJECTS",
+	"CLAUDE_CONFIG_DIR",
 }
 
-// buildDevpassCmd constructs the shell command string for tmux.
-// It optionally prepends an "env VAR=VAL ..." prefix to forward environment
-// variables that the devpass-code process needs but may not inherit via the
-// tmux server's stored environment.  Currently forwards:
-//   - RELAY_DEVPASS_DB    → passed verbatim so fake-devpass-code can find the DB
-//   - RELAY_SPAWN_NONCE   → legacy; retained for marker-format compatibility only
-//   - FAKE_DP_*           → test fault-injection knobs
-//
-// It always appends --print-logs --log-level INFO and redirects stderr to
-// stderrLog: this is the phase-16-verified identity protocol (see
-// docs/BINDING-PROTOCOL.md). The redirection is unconditional and not hidden
-// (no "2>/dev/null || true"); a launch failure surfaces via the tmux exit code.
-func buildDevpassCmd(devpassBin string, args []string, nonce string, stderrLog string) string {
-	// Collect env vars to forward explicitly.
+// buildAgentCmd constructs the shell command string for tmux: an "env K=V ..."
+// prefix forwarding the variables the agent needs but may not inherit through
+// the tmux server, then the quoted agent command and arguments. Nothing is
+// redirected or hidden: a launch failure is visible in the pane and exit status.
+func buildAgentCmd(agent []string, args []string) string {
 	var envPairs []string
-	for _, key := range []string{
-		"RELAY_STATE_DIR",
-		"RELAY_DEVPASS_DB",
-		"XDG_DATA_HOME",
-		"RELAY_NEW_SESSION",
-		"FAKE_DP_FORCE_NEW_SESSION",
-		"FAKE_DP_READY_DELAY_MS",
-		"FAKE_DP_TRANSCRIPT_DELAY_MS",
-		"FAKE_DP_SWALLOW_UNTIL_READY",
-		"FAKE_DP_REFUSE_FIRST_RESUME",
-		"FAKE_DP_SCRIPT",
-		"FAKE_DP_SESSION_ON_PROMPT",
-	} {
+	for _, key := range forwardedEnv {
 		if v := os.Getenv(key); v != "" {
 			envPairs = append(envPairs, key+"="+shellQuote(v))
 		}
 	}
-	// Always forward the nonce if one was provided.
-	if nonce != "" {
-		envPairs = append(envPairs, "RELAY_SPAWN_NONCE="+shellQuote(nonce))
+	var fake []string
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "FAKE_CLAUDE_") {
+			fake = append(fake, kv)
+		}
+	}
+	sort.Strings(fake)
+	for _, kv := range fake {
+		k, v, _ := strings.Cut(kv, "=")
+		if v != "" {
+			envPairs = append(envPairs, k+"="+shellQuote(v))
+		}
 	}
 
-	parts := make([]string, 0, len(args)+3+len(envPairs)+1+2)
+	parts := make([]string, 0, len(agent)+len(args)+len(envPairs)+1)
 	if len(envPairs) > 0 {
 		parts = append(parts, "env")
 		parts = append(parts, envPairs...)
 	}
-	parts = append(parts, shellQuote(devpassBin))
+	for _, a := range agent {
+		parts = append(parts, shellQuote(a))
+	}
 	for _, a := range args {
 		parts = append(parts, shellQuote(a))
 	}
-	// Identity-evidence flags (phase-16-verified protocol): devpass-code must be
-	// launched with these so it logs "message=created id=ses_<ID>" to stderr.
-	parts = append(parts, "--print-logs", "--log-level", "INFO")
-	cmd := strings.Join(parts, " ")
-	if stderrLog != "" {
-		// Redirect stderr to the exclusive per-launch log file. Never hide the
-		// failure of this redirection or of the launched process; any error is
-		// visible via the tmux pane / exit status, unlike a swallowed
-		// "2>/dev/null || true".
-		cmd = cmd + " 2>>" + shellQuote(stderrLog)
-	}
-	return cmd
+	return strings.Join(parts, " ")
 }
 
 // shellQuote wraps a string in single quotes for shell safety.
@@ -611,39 +601,20 @@ func extractHostSessionName() string {
 	return strings.TrimSpace(string(out))
 }
 
-// resolveDevpassBin finds the devpass-code binary.
-func resolveDevpassBin() (string, error) {
-	if v := os.Getenv("RELAY_DEVPASS_BIN"); v != "" {
-		if err := verifyDevpassBin(v); err != nil {
-			return "", fmt.Errorf("RELAY_DEVPASS_BIN %q: %w", v, err)
-		}
-		return v, nil
+// resolveAgentCmd returns the agent command: $RELAY_AGENT_CMD (default
+// "claude") split on whitespace, with its first word resolved on PATH.
+func resolveAgentCmd() ([]string, error) {
+	spec := strings.TrimSpace(os.Getenv("RELAY_AGENT_CMD"))
+	if spec == "" {
+		spec = "claude"
 	}
-	if err := verifyDevpassBin("/usr/local/bin/devpass-code"); err == nil {
-		return "/usr/local/bin/devpass-code", nil
-	}
-	p, err := exec.LookPath("devpass-code")
+	words := strings.Fields(spec)
+	bin, err := exec.LookPath(words[0])
 	if err != nil {
-		return "", fmt.Errorf("devpass-code not found on PATH (set RELAY_DEVPASS_BIN): %w", err)
+		return nil, fmt.Errorf("agent command %q not found on PATH (set RELAY_AGENT_CMD): %w", words[0], err)
 	}
-	if err := verifyDevpassBin(p); err != nil {
-		return "", fmt.Errorf("devpass-code %q: %w", p, err)
-	}
-	return p, nil
-}
-
-func verifyDevpassBin(path string) error {
-	info, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-	if info.Mode()&0111 == 0 {
-		return fmt.Errorf("not executable")
-	}
-	if err := exec.Command(path, "-V").Run(); err == nil {
-		return nil
-	}
-	return exec.Command(path, "--version").Run()
+	words[0] = bin
+	return words, nil
 }
 
 // resolveStateDir returns the state directory.
@@ -655,5 +626,5 @@ func resolveStateDir() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("home dir: %w", err)
 	}
-	return filepath.Join(home, ".devpass-discord-relay"), nil
+	return filepath.Join(home, ".llm-discord-relay"), nil
 }

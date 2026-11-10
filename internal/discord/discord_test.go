@@ -3,7 +3,7 @@ package discord_test
 import (
 	"testing"
 
-	"github.com/devpass/devpass-discord-relay/internal/discord"
+	"github.com/syedmusaasad/LLMDiscordRelay/internal/discord"
 )
 
 func TestNewClient_InvalidToken(t *testing.T) {

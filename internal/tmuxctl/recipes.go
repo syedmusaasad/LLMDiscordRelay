@@ -4,19 +4,35 @@ import (
 	"fmt"
 )
 
-// KeyRecipe is the exact ordered sequence sent to a devpass-code pane.
+// KeyRecipe is the exact ordered sequence of tmux key names sent to a Claude
+// Code pane.
 type KeyRecipe []string
 
-// ApprovalApproveRecipe selects the default "Allow once" action then confirms.
-// verified against devpass-code 1.18.11
-var ApprovalApproveRecipe = KeyRecipe{"Enter"}
+// ApprovalApproveRecipe answers a permission prompt with option 1 ("Yes").
+// verified against Claude Code 2.1.319
+var ApprovalApproveRecipe = KeyRecipe{"1"}
 
-// ApprovalDenyRecipe selects "Reject" from "Allow once", "Allow always", "Reject" then confirms.
-// verified against devpass-code 1.18.11
-var ApprovalDenyRecipe = KeyRecipe{"Right", "Right", "Enter"}
+// ApprovalDenyRecipe cancels a permission prompt. Escape rejects the tool use;
+// pressing the "No" digit would also interrupt the turn.
+// verified against Claude Code 2.1.319
+var ApprovalDenyRecipe = KeyRecipe{"Escape"}
 
-// QuestionSelectRecipe moves from the currently highlighted fake picker option to
-// the selected option and confirms. unverified against real TUI; verified against devpass-code 1.18.11 fake CLI picker
+// TrustAcceptRecipe answers the folder-trust dialog: the default is "No, exit",
+// so move down to "Yes, I trust this folder" and confirm.
+// verified against Claude Code 2.1.319
+var TrustAcceptRecipe = KeyRecipe{"Down", "Enter"}
+
+// TrustDenyRecipe dismisses the folder-trust dialog without trusting.
+// verified against Claude Code 2.1.319
+var TrustDenyRecipe = KeyRecipe{"Escape"}
+
+// QuestionCancelRecipe dismisses an AskUserQuestion picker ("Esc to cancel").
+// verified against Claude Code 2.1.319 (picker footer: "Esc to cancel")
+var QuestionCancelRecipe = KeyRecipe{"Escape"}
+
+// QuestionSelectRecipe moves from the first option of an AskUserQuestion picker
+// to the wanted one (Down repeated) and confirms with Enter.
+// verified against Claude Code 2.1.319
 var QuestionSelectRecipe = KeyRecipe{"Down", "Enter"}
 
 // SendRecipe sends each named tmux key in order. Recipes deliberately use named
@@ -34,16 +50,24 @@ func SendRecipe(target string, recipe KeyRecipe) error {
 	return nil
 }
 
-// SelectQuestion sends the pinned picker recipe, repeating Down for the requested
-// zero-based option index.
-func SelectQuestion(target string, option int) error {
+// QuestionRecipe returns the keys that select the zero-based option: Down once
+// per index, then Enter.
+func QuestionRecipe(option int) (KeyRecipe, error) {
 	if option < 0 {
-		return fmt.Errorf("tmuxctl: negative question option %d", option)
+		return nil, fmt.Errorf("tmuxctl: negative question option %d", option)
 	}
 	recipe := make(KeyRecipe, 0, option+1)
 	for i := 0; i < option; i++ {
 		recipe = append(recipe, QuestionSelectRecipe[0])
 	}
-	recipe = append(recipe, QuestionSelectRecipe[len(QuestionSelectRecipe)-1])
+	return append(recipe, QuestionSelectRecipe[len(QuestionSelectRecipe)-1]), nil
+}
+
+// SelectQuestion sends the picker recipe for the zero-based option index.
+func SelectQuestion(target string, option int) error {
+	recipe, err := QuestionRecipe(option)
+	if err != nil {
+		return err
+	}
 	return SendRecipe(target, recipe)
 }
