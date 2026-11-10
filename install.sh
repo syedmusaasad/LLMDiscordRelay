@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
-CONFIG_DIR="$HOME/.config/devpass-discord-relay"
+CONFIG_DIR="$HOME/.config/llm-discord-relay"
 UNIT_DIR="$HOME/.config/systemd/user"
 ENV_FILE="$CONFIG_DIR/.env"
 ENV_BACKUP="$ENV_FILE.install.bak"
@@ -32,14 +32,14 @@ fi
 # install(1) unlinks and recreates the destination, so replacing a running
 # binary does not fail with ETXTBSY.
 install -m 0755 "$SRC_BIN/relay" "$BIN_DIR/relay"
-install -m 0755 "$SRC_BIN/dpmux" "$BIN_DIR/dpmux"
+install -m 0755 "$SRC_BIN/llmux" "$BIN_DIR/llmux"
 printf '%s\n' "$ROOT" > "$CONFIG_DIR/install-source"
-install -m 0644 "$ROOT/systemd/devpass-discord-relay.service" "$UNIT_DIR/devpass-discord-relay.service"
+install -m 0644 "$ROOT/systemd/llm-discord-relay.service" "$UNIT_DIR/llm-discord-relay.service"
 
 if [[ "${RELAY_INSTALL_SKIP_SYSTEMD:-}" != 1 ]]; then
   systemctl --user daemon-reload
-  systemctl --user enable --now devpass-discord-relay.service
+  systemctl --user enable --now llm-discord-relay.service
 fi
 restore_env
 trap - EXIT
-printf 'installed relay and dpmux in %s\n' "$BIN_DIR"
+printf 'installed relay and llmux in %s\n' "$BIN_DIR"

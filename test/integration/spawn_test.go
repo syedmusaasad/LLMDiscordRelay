@@ -1,729 +1,323 @@
 //go:build integration
 
-// spawn_test.go: integration tests for milestone 3 (spawn from Discord message).
+// spawn_test.go: integration tests for milestone 3 (spawn a Claude Code session
+// from a Discord channel message) and the fail-closed binding contract
+// (docs/BINDING-PROTOCOL.md): llmux chooses the session id, so a transcript with
+// exactly that id is the only thing that can ever be bound.
 package integration
 
 import (
-	"database/sql"
+	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
-// ── TestInvariant1_OwnTranscriptBinding ──────────────────────────────────────
-//
-// Invariant 1: a stale session row created AFTER relay start but BEFORE the
-// spawn must never be bound to the spawn, even if its id sorts lexicographically
-// first among all rows created after relay start.
-//
-// Setup:
-//  1. Create a DB (no pre-existing rows) and start the relay.
-//  2. Insert a "stale" session row whose id sorts before all real session ids
-//     (e.g. "ses_000_stale") and whose time_created is after relay start but
-//     will be before spawnStart.  Its title is a plain string (no nonce prefix)
-//     so neither scanSessions nor handleSpawnFromDiscord can match it.
-//  3. Wait for the relay to see the stale row (one poll cycle).
-//  4. Send a Discord channel message to the relay channel.  The relay spawns
-//     dpmux, which launches fake-devpass-code and creates a NEW session row
-//     with a nonce-bearing title.  FAKE_DP_FORCE_NEW_SESSION=1 prevents
-//     fake-devpass-code from auto-resuming the stale row.
-//  5. Verify the relay creates a Discord thread for the NEW session only.
-//     The stale session id must not appear in any sent message.
-//  6. Verify the original Discord message text is injected as the first prompt
-//     in the NEW session.
-func TestInvariant1_OwnTranscriptBinding(t *testing.T) {
-	mustBin(t, "tmux")
-	mustBin(t, "dpmux")
-	fakeDP := mustBin(t, "fake-devpass-code")
-	relayBin := mustBin(t, "relay")
-	mockDS := mustBin(t, "mock-discord")
-
-	xdgHome := t.TempDir()
-	stateDir := t.TempDir()
-	dbPath := filepath.Join(xdgHome, "devpass-code", "opencode.db")
-
-	mockPort := "19890"
-	mockGWPort := "19891"
-	startMockDiscord(t, mockDS, mockPort, mockGWPort)
-	if err := waitForHTTP(fmt.Sprintf("http://127.0.0.1:%s/api/v10/gateway", mockPort), 5*time.Second); err != nil {
-		t.Fatalf("mock-discord not ready: %v", err)
-	}
-
-	// ── Step 1: Create an empty DB and start the relay ────────────────────────
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
-		t.Fatal(err)
-	}
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := applyTestSchema(db); err != nil {
-		t.Fatalf("schema: %v", err)
-	}
-	db.Close()
-
-	// FAKE_DP_FORCE_NEW_SESSION=1 prevents fake-devpass-code from auto-resuming
-	// the stale session when launched by dpmux.  This ensures a brand-new
-	// session row with a nonce-bearing title is created after spawnStart.
-	relayCmd := exec.Command(relayBin)
-	relayCmd.Env = append(os.Environ(),
-		"DISCORD_TOKEN=test-token",
-		"DISCORD_CHANNEL_ID=test-spawn-ch1",
-		fmt.Sprintf("DISCORD_API_URL=http://127.0.0.1:%s", mockPort),
-		fmt.Sprintf("RELAY_DEVPASS_DB=%s", dbPath),
-		fmt.Sprintf("RELAY_STATE_DIR=%s", stateDir),
-		"DISCORD_USER_ID=user-inv1-001",
-		fmt.Sprintf("RELAY_DEVPASS_BIN=%s", fakeDP),
-		"FAKE_DP_FORCE_NEW_SESSION=1",
-		"FAKE_DP_SESSION_ON_PROMPT=1", // real 1.18.11: session exists only after the first prompt
-	)
-	relayCmd.Stdout = io.Discard
-	relayCmd.Stderr = os.Stderr
-	if err := relayCmd.Start(); err != nil {
-		t.Fatalf("start relay: %v", err)
-	}
-	t.Cleanup(func() { relayCmd.Process.Kill() })
-
-	// Allow the relay one poll cycle to start watching before we insert the stale row.
-	time.Sleep(1200 * time.Millisecond)
-
-	// ── Step 2: Insert a stale row AFTER relay start, BEFORE spawn ────────────
-	//
-	// The stale session has:
-	//   - An id that sorts BEFORE any real session id ("ses_000..." < "ses_1...")
-	//   - A plain title (no "nonce:" prefix) so the nonce-based binder cannot match it
-	//   - time_created = now (which is after relay start but will be before spawnStart)
-	//
-	// This is the exact race the invariant test is guarding against: a process
-	// (e.g. another relay instance or a background task) creating a session row
-	// that, under a naive time-ordering binder, would be selected instead of the
-	// real spawn session.
-	db2, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	staleSessionID := "ses_000_stale_invariant1"
-	staleCreatedAt := time.Now().UnixMilli()
-	insertTestSession(t, db2, staleSessionID, staleCreatedAt)
-	db2.Close()
-	t.Logf("stale session inserted: id=%s (sorts first, no nonce, created after relay start)", staleSessionID)
-
-	// Allow one more poll cycle so the relay sees the stale row.
-	// The relay should not pair it (no matching nonce in title → no pending marker match).
-	time.Sleep(1200 * time.Millisecond)
-
-	// ── Step 3: Dispatch a channel message to trigger spawn ───────────────────
-	// spawnStart is recorded BEFORE the event is dispatched so it is strictly
-	// less than the new session's time_created.
-	spawnStart := time.Now().UnixMilli()
-	channelMsg := buildMessageEvent(
-		"msg-inv1-trigger",
-		"test-spawn-ch1",
-		"user-inv1-001",
-		false,
-		"invariant1: this is the first prompt",
-		nil,
-	)
-	waitForRelayReady(t, stateDir)
-	if err := dispatchEvent(mockPort, channelMsg); err != nil {
-		t.Fatalf("dispatch channel message: %v", err)
-	}
-	t.Logf("spawn triggered at spawnStart=%d (stale row created at %d)", spawnStart, staleCreatedAt)
-
-	// Verify staleCreatedAt < spawnStart: the stale row was created before the spawn.
-	if staleCreatedAt >= spawnStart {
-		t.Logf("warning: stale row created at same ms as spawnStart; test may be less precise")
-	}
-
-	// ── Step 4: Wait for the relay to create a thread ─────────────────────────
-	var threadID string
-	if err := waitForThreadCreation(t, mockPort, &threadID, 60*time.Second); err != nil {
-		t.Fatalf("thread not created within 60s: %v", err)
-	}
-	t.Logf("thread created: id=%s", threadID)
-
-	// ── Step 5: Verify correct session was bound ──────────────────────────────
-	msgs, err := getSentMessages(mockPort)
-	if err != nil {
-		t.Fatalf("get sent messages: %v", err)
-	}
-
-	// The stale session id must NOT appear in any Discord message.
-	for _, m := range msgs {
-		c := contentOf(m)
-		if strings.Contains(c, staleSessionID) {
-			t.Errorf("stale session %q appeared in Discord message %q; spawn path bound the wrong session", staleSessionID, c)
-		}
-	}
-
-	// At least one message must reference a new session (ses_... other than stale).
-	var newSessionFound bool
-	for _, m := range msgs {
-		c := contentOf(m)
-		if strings.Contains(c, "ses_") && !strings.Contains(c, staleSessionID) {
-			newSessionFound = true
-			break
-		}
-	}
-	if !newSessionFound {
-		contents := make([]string, 0, len(msgs))
-		for _, m := range msgs {
-			contents = append(contents, contentOf(m))
-		}
-		t.Errorf("no new session id found in Discord messages; messages: %v", contents)
-	}
-	t.Log("✓ Invariant 1: stale session not bound; new session referenced in Discord")
-
-	// ── Step 6: Verify first prompt injected ─────────────────────────────────
-	// Find the new session: created after spawnStart, id != staleSessionID.
-	db3, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db3.Close()
-
-	var newSessionID string
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		db3.QueryRow(
-			`SELECT id FROM session WHERE id != ? AND time_created >= ? AND parent_id IS NULL ORDER BY time_created DESC LIMIT 1`,
-			staleSessionID, spawnStart,
-		).Scan(&newSessionID)
-		if newSessionID != "" {
-			break
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	if newSessionID == "" {
-		t.Fatal("no new session row with time_created >= spawnStart in DB")
-	}
-	t.Logf("new session id: %s (sorts after stale %s: %v)", newSessionID, staleSessionID, newSessionID > staleSessionID)
-
-	if err := waitForUserPrompt(t, db3, newSessionID, "invariant1: this is the first prompt", 30*time.Second); err != nil {
-		t.Fatalf("first prompt not injected into new session: %v", err)
-	}
-	t.Log("✓ first prompt injected into the new (non-stale) session")
-
-	// Clean up dp-* tmux sessions.
-	t.Cleanup(func() {
-		if out, err := exec.Command("tmux", "list-sessions", "-F", "#{session_name}").Output(); err == nil {
-			for _, sess := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-				if strings.HasPrefix(sess, "dp-") {
-					exec.Command("tmux", "kill-session", "-t", sess).Run()
-				}
-			}
-		}
-	})
-}
-
-// ── TestSpawn_ChannelMessageTriggersDpmux ──────────────────────────────────
-//
-// Verifies end-to-end that a Discord message in the relay channel (not a thread)
-// causes the relay to spawn dpmux and create a Discord thread for the new session.
-// Also verifies the original message text is injected as the first prompt.
-func TestSpawn_ChannelMessageTriggersDpmux(t *testing.T) {
-	mustBin(t, "tmux")
-	mustBin(t, "dpmux")
-	fakeDP := mustBin(t, "fake-devpass-code")
-	relayBin := mustBin(t, "relay")
-	mockDS := mustBin(t, "mock-discord")
-
-	xdgHome := t.TempDir()
-	stateDir := t.TempDir()
-	dbPath := filepath.Join(xdgHome, "devpass-code", "opencode.db")
-
-	mockPort := "19892"
-	mockGWPort := "19893"
-	startMockDiscord(t, mockDS, mockPort, mockGWPort)
-	if err := waitForHTTP(fmt.Sprintf("http://127.0.0.1:%s/api/v10/gateway", mockPort), 5*time.Second); err != nil {
-		t.Fatalf("mock-discord not ready: %v", err)
-	}
-
-	// Start relay with RELAY_DEVPASS_BIN pointing at fake-devpass-code.
-	// No pre-existing sessions in DB: fake-devpass-code will create a fresh one.
-	relayCmd := exec.Command(relayBin)
-	relayCmd.Env = append(os.Environ(),
-		"DISCORD_TOKEN=test-token",
-		"DISCORD_CHANNEL_ID=test-spawn-ch2",
-		fmt.Sprintf("DISCORD_API_URL=http://127.0.0.1:%s", mockPort),
-		fmt.Sprintf("RELAY_DEVPASS_DB=%s", dbPath),
-		fmt.Sprintf("RELAY_STATE_DIR=%s", stateDir),
-		"DISCORD_USER_ID=user-spawn-002",
-		fmt.Sprintf("RELAY_DEVPASS_BIN=%s", fakeDP),
-		"FAKE_DP_FORCE_NEW_SESSION=1",
-		"FAKE_DP_SESSION_ON_PROMPT=1", // real 1.18.11: session exists only after the first prompt
-	)
-	relayCmd.Stdout = io.Discard
-	relayCmd.Stderr = os.Stderr
-	if err := relayCmd.Start(); err != nil {
-		t.Fatalf("start relay: %v", err)
-	}
-	t.Cleanup(func() { relayCmd.Process.Kill() })
-	time.Sleep(300 * time.Millisecond)
-
-	// Send a message in the main channel.
-	channelMsg := buildMessageEvent(
-		"msg-ch-spawn-002",
-		"test-spawn-ch2",
-		"user-spawn-002",
-		false,
-		"please do something useful for me",
-		nil,
-	)
-	waitForRelayReady(t, stateDir)
-	if err := dispatchEvent(mockPort, channelMsg); err != nil {
-		t.Fatalf("dispatch: %v", err)
-	}
-
-	// Wait for a thread to be created.
-	var threadID string
-	if err := waitForThreadCreation(t, mockPort, &threadID, 60*time.Second); err != nil {
-		t.Fatalf("thread not created: %v", err)
-	}
-	t.Logf("✓ thread created: id=%s", threadID)
-
-	// Verify the first prompt lands in the DB.
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	var sessionID string
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		err = db.QueryRow(`SELECT session_id FROM part WHERE data LIKE ? ORDER BY time_created DESC LIMIT 1`, "%please do something useful for me%").Scan(&sessionID)
-		if err == nil && sessionID != "" {
-			break
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	if sessionID == "" {
-		t.Fatal("no spawned prompt owner")
-	}
-	t.Logf("session id: %s", sessionID)
-
-	if err := waitForUserPrompt(t, db, sessionID, "please do something useful for me", 30*time.Second); err != nil {
-		t.Fatalf("first prompt not injected: %v", err)
-	}
-	t.Log("✓ first prompt injected into the spawned session")
-
-	// Clean up dp-* tmux sessions.
-	t.Cleanup(func() {
-		if out, err := exec.Command("tmux", "list-sessions", "-F", "#{session_name}").Output(); err == nil {
-			for _, sess := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-				if strings.HasPrefix(sess, "dp-") {
-					exec.Command("tmux", "kill-session", "-t", sess).Run()
-				}
-			}
-		}
-	})
-}
-
-// ── TestInvariant1_ConcurrentForeignSessionRejected ──────────────────────────
-//
-// Invariant 1 (phase-15-fix): an unrelated, foreign top-level session row that
-// appears AFTER spawn start but BEFORE the real spawn's own (delayed) row —
-// including a row created in the exact same working directory — must never be
-// bound. Only the session actually proven via the phase-16-verified stderr-log
-// identity protocol (message=created id=ses_<ID> in the launch's own exclusive
-// stderr file) is bound and receives the queued prompt.
-//
-// Setup:
-//  1. Start the relay watching an empty DB.
-//  2. Dispatch a Discord channel message to trigger a spawn. fake-devpass-code
-//     is configured with FAKE_DP_TRANSCRIPT_DELAY_MS so it delays creating its
-//     own session row, opening a window during which...
-//  3. ...a foreign top-level session row is inserted directly into the DB
-//     (simulating an unrelated concurrent process, in the same "directory"
-//     column value) with a time_created between spawnStart and the real row's
-//     eventual creation.
-//  4. Only the real (delayed) session — proven by its own exclusive stderr log
-//     — must be bound: the foreign session id must never appear in any Discord
-//     message, and the first prompt must land in the real session only.
-func TestInvariant1_ConcurrentForeignSessionRejected(t *testing.T) {
-	mustBin(t, "tmux")
-	mustBin(t, "dpmux")
-	fakeDP := mustBin(t, "fake-devpass-code")
-	relayBin := mustBin(t, "relay")
-	mockDS := mustBin(t, "mock-discord")
-
-	xdgHome := t.TempDir()
-	stateDir := t.TempDir()
-	dbPath := filepath.Join(xdgHome, "devpass-code", "opencode.db")
-
-	mockPort := "19898"
-	mockGWPort := "19899"
-	startMockDiscord(t, mockDS, mockPort, mockGWPort)
-	if err := waitForHTTP(fmt.Sprintf("http://127.0.0.1:%s/api/v10/gateway", mockPort), 5*time.Second); err != nil {
-		t.Fatalf("mock-discord not ready: %v", err)
-	}
-
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
-		t.Fatal(err)
-	}
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := applyTestSchema(db); err != nil {
-		t.Fatalf("schema: %v", err)
-	}
-	db.Close()
-
-	// fake-devpass-code will sleep 2s before creating its own session row,
-	// giving the test time to insert a foreign row first.
-	relayCmd := exec.Command(relayBin)
-	relayCmd.Env = append(os.Environ(),
-		"DISCORD_TOKEN=test-token",
-		"DISCORD_CHANNEL_ID=test-spawn-ch3",
-		fmt.Sprintf("DISCORD_API_URL=http://127.0.0.1:%s", mockPort),
-		fmt.Sprintf("RELAY_DEVPASS_DB=%s", dbPath),
-		fmt.Sprintf("RELAY_STATE_DIR=%s", stateDir),
-		"DISCORD_USER_ID=user-inv1c-001",
-		fmt.Sprintf("RELAY_DEVPASS_BIN=%s", fakeDP),
-		"FAKE_DP_FORCE_NEW_SESSION=1",
-		"FAKE_DP_TRANSCRIPT_DELAY_MS=2000",
-	)
-	relayCmd.Stdout = io.Discard
-	relayCmd.Stderr = os.Stderr
-	if err := relayCmd.Start(); err != nil {
-		t.Fatalf("start relay: %v", err)
-	}
-	t.Cleanup(func() { relayCmd.Process.Kill() })
-	time.Sleep(300 * time.Millisecond)
-
-	spawnStart := time.Now().UnixMilli()
-	channelMsg := buildMessageEvent(
-		"msg-inv1c-trigger",
-		"test-spawn-ch3",
-		"user-inv1c-001",
-		false,
-		"invariant1c: this is the first prompt",
-		nil,
-	)
-	waitForRelayReady(t, stateDir)
-	if err := dispatchEvent(mockPort, channelMsg); err != nil {
-		t.Fatalf("dispatch channel message: %v", err)
-	}
-	t.Logf("spawn triggered at spawnStart=%d", spawnStart)
-
-	// Give dpmux time to launch and write the pending marker, then insert the
-	// foreign row BEFORE the fake's own (delayed ~2s) row appears.
-	time.Sleep(600 * time.Millisecond)
-
-	db2, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	foreignSessionID := "ses_concurrent_foreign_001"
-	foreignCreatedAt := time.Now().UnixMilli()
-	if foreignCreatedAt < spawnStart {
-		foreignCreatedAt = spawnStart + 1
-	}
-	// Same "directory" value as the real spawn would use (relay's cwd) — a
-	// shared directory alone must not be treated as proof of ownership.
-	wd, _ := os.Getwd()
-	_, err = db2.Exec(
-		`INSERT INTO session(id,project_id,slug,directory,title,version,time_created,time_updated)
-		 VALUES(?,?,?,?,?,?,?,?)`,
-		foreignSessionID, "proj-test", "foreign-slug", wd, "Foreign Concurrent Session", "1.18.11",
-		foreignCreatedAt, foreignCreatedAt,
-	)
-	db2.Close()
-	if err != nil {
-		t.Fatalf("insert foreign session: %v", err)
-	}
-	t.Logf("foreign session inserted: id=%s createdAt=%d (after spawnStart, before real row)", foreignSessionID, foreignCreatedAt)
-
-	// ── Wait for the relay to create a thread ─────────────────────────────
-	var threadID string
-	if err := waitForThreadCreation(t, mockPort, &threadID, 60*time.Second); err != nil {
-		t.Fatalf("thread not created within 60s: %v", err)
-	}
-	t.Logf("thread created: id=%s", threadID)
-
-	msgs, err := getSentMessages(mockPort)
-	if err != nil {
-		t.Fatalf("get sent messages: %v", err)
-	}
-
-	// The foreign session id must NEVER appear in any Discord message.
-	for _, m := range msgs {
-		c := contentOf(m)
-		if strings.Contains(c, foreignSessionID) {
-			t.Errorf("foreign session %q appeared in Discord message %q; spawn path bound the wrong session", foreignSessionID, c)
-		}
-	}
-
-	var boundSessionID string
-	for _, m := range msgs {
-		c := contentOf(m)
-		if strings.Contains(c, "ses_") && !strings.Contains(c, foreignSessionID) {
-			// Extract the session id token starting with ses_.
-			idx := strings.Index(c, "ses_")
-			rest := c[idx:]
-			end := len(rest)
-			for i, ch := range rest {
-				if ch == '`' || ch == '\n' || ch == ' ' {
-					end = i
-					break
-				}
-			}
-			boundSessionID = rest[:end]
-			break
-		}
-	}
-	if boundSessionID == "" {
-		contents := make([]string, 0, len(msgs))
-		for _, m := range msgs {
-			contents = append(contents, contentOf(m))
-		}
-		t.Fatalf("no real session id found in Discord messages; messages: %v", contents)
-	}
-	if boundSessionID == foreignSessionID {
-		t.Fatalf("relay bound the foreign session %q", foreignSessionID)
-	}
-	t.Logf("✓ Invariant 1c: foreign concurrent session rejected; bound session: %s", boundSessionID)
-
-	// ── Verify the first prompt landed only in the real (bound) session ────
-	db3, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db3.Close()
-
-	if err := waitForUserPrompt(t, db3, boundSessionID, "invariant1c: this is the first prompt", 30*time.Second); err != nil {
-		t.Fatalf("first prompt not injected into bound session: %v", err)
-	}
-	var foreignPromptCount int
-	db3.QueryRow(
-		`SELECT COUNT(*) FROM part WHERE session_id = ? AND data LIKE ?`,
-		foreignSessionID, "%invariant1c: this is the first prompt%",
-	).Scan(&foreignPromptCount)
-	if foreignPromptCount > 0 {
-		t.Errorf("prompt was injected into the foreign session %q; expected only the real session", foreignSessionID)
-	}
-	t.Log("✓ first prompt injected only into the real, verified session")
-
-	t.Cleanup(func() {
-		if out, err := exec.Command("tmux", "list-sessions", "-F", "#{session_name}").Output(); err == nil {
-			for _, sess := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-				if strings.HasPrefix(sess, "dp-") {
-					exec.Command("tmux", "kill-session", "-t", sess).Run()
-				}
-			}
-		}
-	})
-}
-
-// ── TestInvariant1_MissingIdentityFailsClosed ────────────────────────────────
-//
-// Invariant 1 (phase-15-fix): when identity evidence is absent or invalid — no
-// "message=created id=ses_<ID>" line ever appears in the launch's own stderr
-// log (e.g. the process never gets --print-logs support, or the pane dies
-// during the wait) — the relay must NEVER claim, mirror, or inject into any
-// row, even when eligible foreign rows exist in the DB and the pane was
-// briefly alive.
-//
-// Setup:
-//  1. Start the relay with a short RELAY_SPAWN_BIND_TIMEOUT_MS.
-//  2. Point RELAY_DEVPASS_BIN at a stub that starts (so the pane is briefly
-//     alive), writes NOTHING to stderr, and then exits quickly (pane dies
-//     during the wait).
-//  3. Insert an eligible foreign top-level row (time_created >= spawnInstant)
-//     into the DB — a naive first-row-after-spawn binder would incorrectly
-//     bind it.
-//  4. Assert: no Discord thread/message is ever created referencing any
-//     session, and no text is ever injected into any pane.
-func TestInvariant1_MissingIdentityFailsClosed(t *testing.T) {
-	mustBin(t, "tmux")
-	mustBin(t, "dpmux")
-	relayBin := mustBin(t, "relay")
-	mockDS := mustBin(t, "mock-discord")
-
-	xdgHome := t.TempDir()
-	stateDir := t.TempDir()
-	dbPath := filepath.Join(xdgHome, "devpass-code", "opencode.db")
-
-	mockPort := "19900"
-	mockGWPort := "19901"
-	startMockDiscord(t, mockDS, mockPort, mockGWPort)
-	if err := waitForHTTP(fmt.Sprintf("http://127.0.0.1:%s/api/v10/gateway", mockPort), 5*time.Second); err != nil {
-		t.Fatalf("mock-discord not ready: %v", err)
-	}
-
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
-		t.Fatal(err)
-	}
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := applyTestSchema(db); err != nil {
-		t.Fatalf("schema: %v", err)
-	}
-	db.Close()
-
-	// Stub "devpass-code": starts (pane briefly alive), never logs anything to
-	// stderr, then exits immediately — simulating both "no identity evidence"
-	// and "pane dies during the wait".
-	stubScript := filepath.Join(t.TempDir(), "stub-no-identity")
-	stubContent := "#!/bin/sh\n# No stderr identity evidence is ever written. Exit quickly.\nsleep 0.3\nexit 0\n"
-	if err := os.WriteFile(stubScript, []byte(stubContent), 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	relayCmd := exec.Command(relayBin)
-	relayCmd.Env = append(os.Environ(),
-		"DISCORD_TOKEN=test-token",
-		"DISCORD_CHANNEL_ID=test-spawn-ch4",
-		fmt.Sprintf("DISCORD_API_URL=http://127.0.0.1:%s", mockPort),
-		fmt.Sprintf("RELAY_DEVPASS_DB=%s", dbPath),
-		fmt.Sprintf("RELAY_STATE_DIR=%s", stateDir),
-		"DISCORD_USER_ID=user-inv1m-001",
-		fmt.Sprintf("RELAY_DEVPASS_BIN=%s", stubScript),
-		"RELAY_SPAWN_BIND_TIMEOUT_MS=3000",
-	)
-	relayCmd.Stdout = io.Discard
-	relayCmd.Stderr = os.Stderr
-	if err := relayCmd.Start(); err != nil {
-		t.Fatalf("start relay: %v", err)
-	}
-	t.Cleanup(func() { relayCmd.Process.Kill() })
-	time.Sleep(300 * time.Millisecond)
-
-	spawnStart := time.Now().UnixMilli()
-	channelMsg := buildMessageEvent(
-		"msg-inv1m-trigger",
-		"test-spawn-ch4",
-		"user-inv1m-001",
-		false,
-		"invariant1m: should never be injected",
-		nil,
-	)
-	waitForRelayReady(t, stateDir)
-	if err := dispatchEvent(mockPort, channelMsg); err != nil {
-		t.Fatalf("dispatch channel message: %v", err)
-	}
-
-	// While the bind wait is in progress, insert an eligible foreign row that a
-	// naive first-row-after-spawn binder would have accepted.
-	time.Sleep(500 * time.Millisecond)
-	db2, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	eligibleForeignID := "ses_eligible_but_unproven_001"
-	foreignCreatedAt := spawnStart + 100
-	_, err = db2.Exec(
-		`INSERT INTO session(id,project_id,slug,directory,title,version,time_created,time_updated)
-		 VALUES(?,?,?,?,?,?,?,?)`,
-		eligibleForeignID, "proj-test", "elig-slug", "/tmp", "Eligible Unproven", "1.18.11",
-		foreignCreatedAt, foreignCreatedAt,
-	)
-	db2.Close()
-	if err != nil {
-		t.Fatalf("insert eligible foreign session: %v", err)
-	}
-	t.Logf("eligible-but-unproven foreign session inserted: id=%s createdAt=%d", eligibleForeignID, foreignCreatedAt)
-
-	// Wait past the bind timeout to give handleSpawnFromDiscord a chance to
-	// (incorrectly) bind, then assert it never did.
-	time.Sleep(5 * time.Second)
-
-	msgs, err := getSentMessages(mockPort)
-	if err != nil {
-		t.Fatalf("get sent messages: %v", err)
-	}
-	if len(msgs) != 0 {
-		contents := make([]string, 0, len(msgs))
-		for _, m := range msgs {
-			contents = append(contents, contentOf(m))
-		}
-		t.Fatalf("expected no Discord messages/threads when identity evidence is missing, got %d: %v", len(msgs), contents)
-	}
-	t.Log("✓ Invariant 1: missing identity evidence → no thread/message ever created")
-
-	// The queued prompt must never have been injected anywhere, including into
-	// the eligible-but-unproven foreign session.
-	db3, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db3.Close()
-	var injectedCount int
-	db3.QueryRow(
-		`SELECT COUNT(*) FROM part WHERE data LIKE ?`,
-		"%invariant1m: should never be injected%",
-	).Scan(&injectedCount)
-	if injectedCount > 0 {
-		t.Errorf("prompt text was injected somewhere despite missing identity evidence (count=%d)", injectedCount)
-	}
-	t.Log("✓ no injection occurred without verified identity")
-
-	t.Cleanup(func() {
-		if out, err := exec.Command("tmux", "list-sessions", "-F", "#{session_name}").Output(); err == nil {
-			for _, sess := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-				if strings.HasPrefix(sess, "dp-") {
-					exec.Command("tmux", "kill-session", "-t", sess).Run()
-				}
-			}
-		}
-	})
-}
-
-// ── helpers for the phase-2 live-CLI fixes ───────────────────────────────────
-
-// listDpSessions returns the names of all tmux sessions starting with "dp-".
-func listDpSessions() []string {
+// listLlmSessions returns the names of all tmux sessions starting with "llm-".
+func listLlmSessions() []string {
 	out, err := exec.Command("tmux", "list-sessions", "-F", "#{session_name}").Output()
 	if err != nil {
 		return nil
 	}
 	var names []string
 	for _, s := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if strings.HasPrefix(s, "dp-") {
+		if strings.HasPrefix(s, "llm-") {
 			names = append(names, s)
 		}
 	}
 	return names
 }
 
-func killDpSessionsCleanup(t *testing.T) {
+func killLlmSessionsCleanup(t *testing.T) {
+	t.Helper()
 	t.Cleanup(func() {
-		for _, s := range listDpSessions() {
-			exec.Command("tmux", "kill-session", "-t", s).Run()
+		for _, s := range listLlmSessions() {
+			exec.Command("tmux", "kill-session", "-t", "="+s).Run()
 		}
 	})
 }
 
+// spawnRelay starts a relay that spawns fake-claude sessions through the real
+// llmux (RELAY_AGENT_CMD points at fake-claude).
+func spawnRelay(t *testing.T, projects, stateDir, mockPort, channel, user string, extra ...string) {
+	t.Helper()
+	env := []string{
+		"DISCORD_CHANNEL_ID=" + channel,
+		"DISCORD_USER_ID=" + user,
+		"RELAY_AGENT_CMD=" + mustBin(t, "fake-claude"),
+	}
+	startRelay(t, mustBin(t, "relay"), projects, stateDir, mockPort, append(env, extra...)...)
+}
+
+// threadSessionIDs returns every session id mentioned in the sent messages
+// (thread root, thread name) other than the ones in ignore.
+func sentSessionIDs(mockPort string, ignore ...string) []string {
+	skip := map[string]bool{}
+	for _, i := range ignore {
+		skip[i] = true
+	}
+	seen := map[string]bool{}
+	var out []string
+	msgs, _ := getSentMessages(mockPort)
+	for _, m := range msgs {
+		for _, id := range uuidRe.FindAllString(string(m), -1) {
+			if !skip[id] && !seen[id] {
+				seen[id] = true
+				out = append(out, id)
+			}
+		}
+	}
+	return out
+}
+
+// ── TestInvariant1_OwnTranscriptBinding ──────────────────────────────────────
+//
+// Invariant 1: a stale transcript that appears AFTER relay start but BEFORE the
+// spawn must never be bound to the spawn, even though it is a perfectly valid
+// session of the same project.
+//
+// The spawn's identity is the id llmux generated (claude --session-id <id>);
+// nothing is inferred from timing or ordering.
+func TestInvariant1_OwnTranscriptBinding(t *testing.T) {
+	mustBin(t, "tmux")
+	mustBin(t, "llmux")
+	killLlmSessionsCleanup(t)
+	projects, stateDir := t.TempDir(), t.TempDir()
+	mockPort, mockGWPort := "19890", "19891"
+	setupMock(t, mockPort, mockGWPort)
+
+	spawnRelay(t, projects, stateDir, mockPort, "test-spawn-ch1", "user-inv1-001")
+
+	time.Sleep(1200 * time.Millisecond)
+
+	// A stale session of the same project, written after relay start.
+	staleID := testSID(50)
+	newTx(t, projects, staleID).User("an unrelated earlier session").Text("stale reply").TurnEnd()
+	t.Logf("stale session written: id=%s (valid, same project, after relay start)", staleID)
+	time.Sleep(1200 * time.Millisecond)
+
+	waitForRelayReady(t, stateDir)
+	if err := dispatchEvent(mockPort, buildMessageEvent("msg-inv1-trigger", "test-spawn-ch1", "user-inv1-001", false,
+		"invariant1: this is the first prompt", nil)); err != nil {
+		t.Fatalf("dispatch channel message: %v", err)
+	}
+
+	var threadID string
+	if err := waitForThreadCreation(t, mockPort, &threadID, 60*time.Second); err != nil {
+		t.Fatalf("thread not created within 60s: %v", err)
+	}
+	t.Logf("thread created: id=%s", threadID)
+
+	msgs, _ := getSentMessages(mockPort)
+	for _, m := range msgs {
+		if c := contentOf(m); strings.Contains(c, staleID) || strings.Contains(c, "stale reply") {
+			t.Errorf("stale session appeared in Discord message %q; the spawn bound the wrong session", c)
+		}
+	}
+	newID := waitForNewTranscript(t, projects, []string{staleID}, 30*time.Second)
+	if newID == staleID {
+		t.Fatal("spawn reused the stale session")
+	}
+	if err := waitForPrompt(t, projects, newID, "invariant1: this is the first prompt", 30*time.Second); err != nil {
+		t.Fatalf("first prompt not injected into the new session: %v", err)
+	}
+	if n := countPrompts(projects, staleID, "invariant1"); n != 0 {
+		t.Errorf("first prompt was injected into the stale session")
+	}
+	if err := waitForMessageContent(t, mockPort, newID, 10*time.Second); err != nil {
+		t.Errorf("Discord messages never name the spawned session %s: %v", newID, err)
+	}
+	t.Log("✓ Invariant 1: stale session not bound; the llmux-chosen session id is the one mirrored")
+}
+
+// ── TestSpawn_ChannelMessageTriggersLlmux ────────────────────────────────────
+//
+// A Discord message in the relay channel (not a thread) makes the relay spawn
+// llmux, create exactly one Discord thread for the new session, and inject the
+// message text as the first prompt.
+func TestSpawn_ChannelMessageTriggersLlmux(t *testing.T) {
+	mustBin(t, "tmux")
+	mustBin(t, "llmux")
+	killLlmSessionsCleanup(t)
+	projects, stateDir := t.TempDir(), t.TempDir()
+	mockPort, mockGWPort := "19892", "19893"
+	setupMock(t, mockPort, mockGWPort)
+
+	spawnRelay(t, projects, stateDir, mockPort, "test-spawn-ch2", "user-spawn-002")
+	time.Sleep(300 * time.Millisecond)
+
+	waitForRelayReady(t, stateDir)
+	if err := dispatchEvent(mockPort, buildMessageEvent("msg-ch-spawn-002", "test-spawn-ch2", "user-spawn-002", false,
+		"please do something useful for me", nil)); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+
+	var threadID string
+	if err := waitForThreadCreation(t, mockPort, &threadID, 60*time.Second); err != nil {
+		t.Fatalf("thread not created: %v", err)
+	}
+	t.Logf("✓ thread created: id=%s", threadID)
+
+	sessionID := waitForNewTranscript(t, projects, nil, 30*time.Second)
+	if err := waitForPrompt(t, projects, sessionID, "please do something useful for me", 30*time.Second); err != nil {
+		t.Fatalf("first prompt not injected: %v", err)
+	}
+	t.Logf("✓ first prompt injected into the spawned session %s", sessionID)
+
+	// One thread per session: exactly one thread was created for the spawn.
+	time.Sleep(2 * time.Second)
+	if n := countThreads(mockPort); n != 1 {
+		t.Fatalf("expected exactly one thread for one session, got %d", n)
+	}
+	if err := waitForSessionRecord(stateDir, sessionID, 10*time.Second); err != nil {
+		t.Fatalf("session not recorded: %v", err)
+	}
+}
+
+// countThreads counts CreateThread requests (type 11) the mock saw.
+func countThreads(mockPort string) int {
+	n := 0
+	msgs, _ := getSentMessages(mockPort)
+	for _, m := range msgs {
+		var body struct {
+			Type int `json:"type"`
+		}
+		if json.Unmarshal(m, &body) == nil && body.Type == 11 {
+			n++
+		}
+	}
+	return n
+}
+
+// ── TestInvariant1_ConcurrentForeignSessionRejected ──────────────────────────
+//
+// Invariant 1: an unrelated, foreign transcript that appears while the real
+// spawn's own transcript is still delayed — including one in the exact same
+// project directory — must never be bound. Only the session whose id llmux
+// generated is bound and receives the queued prompt.
+func TestInvariant1_ConcurrentForeignSessionRejected(t *testing.T) {
+	mustBin(t, "tmux")
+	mustBin(t, "llmux")
+	killLlmSessionsCleanup(t)
+	projects, stateDir := t.TempDir(), t.TempDir()
+	mockPort, mockGWPort := "19956", "19957"
+	setupMock(t, mockPort, mockGWPort)
+
+	// fake-claude delays creating its own transcript by 2s after the prompt is
+	// submitted, opening a window in which the foreign transcript appears.
+	spawnRelay(t, projects, stateDir, mockPort, "test-spawn-ch3", "user-inv1c-001", "FAKE_CLAUDE_TRANSCRIPT_DELAY_MS=2000")
+	time.Sleep(300 * time.Millisecond)
+
+	waitForRelayReady(t, stateDir)
+	if err := dispatchEvent(mockPort, buildMessageEvent("msg-inv1c-trigger", "test-spawn-ch3", "user-inv1c-001", false,
+		"invariant1c: this is the first prompt", nil)); err != nil {
+		t.Fatalf("dispatch channel message: %v", err)
+	}
+
+	// Give llmux time to launch and write the pending marker, then write the
+	// foreign session BEFORE the fake's own delayed transcript appears.
+	time.Sleep(600 * time.Millisecond)
+	foreignID := testSID(51)
+	if ids := transcriptSessionIDs(projects); len(ids) != 0 {
+		t.Fatalf("real transcript already exists (%v); the delay window is gone", ids)
+	}
+	newTx(t, projects, foreignID).User("a concurrent foreign session").Text("foreign reply").TurnEnd()
+
+	var threadID string
+	if err := waitForThreadCreation(t, mockPort, &threadID, 60*time.Second); err != nil {
+		t.Fatalf("thread not created within 60s: %v", err)
+	}
+
+	msgs, _ := getSentMessages(mockPort)
+	for _, m := range msgs {
+		if c := contentOf(m); strings.Contains(c, foreignID) || strings.Contains(c, "foreign reply") {
+			t.Errorf("foreign session appeared in Discord message %q; the spawn bound the wrong session", c)
+		}
+	}
+	boundID := waitForNewTranscript(t, projects, []string{foreignID}, 30*time.Second)
+	if err := waitForPrompt(t, projects, boundID, "invariant1c: this is the first prompt", 30*time.Second); err != nil {
+		t.Fatalf("first prompt not injected into the bound session: %v", err)
+	}
+	if n := countPrompts(projects, foreignID, "invariant1c"); n != 0 {
+		t.Errorf("prompt was injected into the foreign session; expected only the real session")
+	}
+	if err := waitForMessageContent(t, mockPort, boundID, 10*time.Second); err != nil {
+		t.Errorf("Discord messages never name the bound session %s: %v", boundID, err)
+	}
+	t.Log("✓ Invariant 1c: foreign concurrent session rejected; the prompt landed only in the real session")
+}
+
+// ── TestInvariant1_MissingIdentityFailsClosed ────────────────────────────────
+//
+// Invariant 1 (fail closed): when the launched process never produces a
+// transcript for its id (here it exits right away, so the pane dies during the
+// wait) the relay must NEVER claim, mirror or inject into anything, even when
+// an eligible foreign transcript exists and the pane was briefly alive.
+func TestInvariant1_MissingIdentityFailsClosed(t *testing.T) {
+	mustBin(t, "tmux")
+	mustBin(t, "llmux")
+	killLlmSessionsCleanup(t)
+	projects, stateDir := t.TempDir(), t.TempDir()
+	mockPort, mockGWPort := "19900", "19901"
+	setupMock(t, mockPort, mockGWPort)
+
+	// Stub agent: starts (pane briefly alive), writes nothing, exits.
+	stub := filepath.Join(t.TempDir(), "stub-no-transcript")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\nsleep 0.3\nexit 0\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	startRelay(t, mustBin(t, "relay"), projects, stateDir, mockPort,
+		"DISCORD_CHANNEL_ID=test-spawn-ch4", "DISCORD_USER_ID=user-inv1m-001",
+		"RELAY_AGENT_CMD="+stub, "RELAY_SPAWN_BIND_TIMEOUT_MS=3000")
+	time.Sleep(300 * time.Millisecond)
+
+	waitForRelayReady(t, stateDir)
+	if err := dispatchEvent(mockPort, buildMessageEvent("msg-inv1m-trigger", "test-spawn-ch4", "user-inv1m-001", false,
+		"invariant1m: should never be injected", nil)); err != nil {
+		t.Fatalf("dispatch channel message: %v", err)
+	}
+
+	// While the bind wait is in progress, an eligible foreign session appears.
+	time.Sleep(500 * time.Millisecond)
+	foreignID := testSID(52)
+	newTx(t, projects, foreignID).User("eligible but unproven").Text("unproven reply").TurnEnd()
+
+	// Wait past the bind timeout, then assert nothing was ever bound.
+	time.Sleep(5 * time.Second)
+
+	msgs, _ := getSentMessages(mockPort)
+	if len(msgs) != 0 {
+		contents := make([]string, 0, len(msgs))
+		for _, m := range msgs {
+			contents = append(contents, contentOf(m))
+		}
+		t.Fatalf("expected no Discord messages/threads when no transcript proves the identity, got %d: %v", len(msgs), contents)
+	}
+	t.Log("✓ Invariant 1: no proven identity → no thread/message ever created")
+
+	if n := countPrompts(projects, foreignID, "invariant1m"); n != 0 {
+		t.Errorf("prompt text was injected into the foreign session")
+	}
+	if ids := transcriptSessionIDs(projects); len(ids) != 1 {
+		t.Errorf("unexpected transcripts: %v", ids)
+	}
+	t.Log("✓ no injection occurred without a verified identity")
+}
+
 // ── TestSpawn_PromptBeforeBind ───────────────────────────────────────────────
 //
-// Real devpass-code 1.18.11 creates its session (DB row + "message=created"
-// stderr line) only AFTER the first prompt arrives (docs/BINDING-PROTOCOL.md).
-// FAKE_DP_SESSION_ON_PROMPT=1 reproduces that. The relay must therefore deliver
-// the prompt first and bind from the created line afterwards. Against the old
-// bind-then-inject order this deadlocks until the bind timeout and never
-// creates a thread.
+// Claude Code writes its transcript only when the first prompt is submitted, so
+// the relay must deliver the prompt first and bind afterwards; binding before
+// injecting would deadlock until the bind timeout and never create a thread.
 func TestSpawn_PromptBeforeBind(t *testing.T) {
 	mustBin(t, "tmux")
-	mustBin(t, "dpmux")
-	fakeDP := mustBin(t, "fake-devpass-code")
-	relayBin := mustBin(t, "relay")
-	mockDS := mustBin(t, "mock-discord")
-	killDpSessionsCleanup(t)
-
-	xdgHome := t.TempDir()
-	stateDir := t.TempDir()
-	dbPath := filepath.Join(xdgHome, "devpass-code", "opencode.db")
+	mustBin(t, "llmux")
+	killLlmSessionsCleanup(t)
+	projects, stateDir := t.TempDir(), t.TempDir()
 
 	const prompt = "prompt-before-bind: hello from discord"
 	const reply = "PBB-REPLY-MIRRORED"
@@ -733,45 +327,21 @@ func TestSpawn_PromptBeforeBind(t *testing.T) {
 	}
 
 	mockPort, mockGWPort := "19940", "19941"
-	startMockDiscord(t, mockDS, mockPort, mockGWPort)
-	if err := waitForHTTP(fmt.Sprintf("http://127.0.0.1:%s/api/v10/gateway", mockPort), 5*time.Second); err != nil {
-		t.Fatalf("mock-discord not ready: %v", err)
-	}
-
-	relayCmd := exec.Command(relayBin)
-	relayCmd.Env = append(os.Environ(),
-		"DISCORD_TOKEN=test-token",
-		"DISCORD_CHANNEL_ID=test-spawn-pbb",
-		fmt.Sprintf("DISCORD_API_URL=http://127.0.0.1:%s", mockPort),
-		fmt.Sprintf("RELAY_DEVPASS_DB=%s", dbPath),
-		fmt.Sprintf("RELAY_STATE_DIR=%s", stateDir),
-		"DISCORD_USER_ID=user-pbb-001",
-		fmt.Sprintf("RELAY_DEVPASS_BIN=%s", fakeDP),
-		"FAKE_DP_SESSION_ON_PROMPT=1",
-		"FAKE_DP_FORCE_NEW_SESSION=1",
-		"FAKE_DP_SCRIPT="+script,
-		"RELAY_SPAWN_BIND_TIMEOUT_MS=15000",
-	)
-	relayCmd.Stdout = io.Discard
-	relayCmd.Stderr = os.Stderr
-	if err := relayCmd.Start(); err != nil {
-		t.Fatalf("start relay: %v", err)
-	}
-	t.Cleanup(func() { relayCmd.Process.Kill() })
+	setupMock(t, mockPort, mockGWPort)
+	spawnRelay(t, projects, stateDir, mockPort, "test-spawn-pbb", "user-pbb-001",
+		"FAKE_CLAUDE_SCRIPT="+script, "RELAY_SPAWN_BIND_TIMEOUT_MS=15000")
 
 	waitForRelayReady(t, stateDir)
 	if err := dispatchEvent(mockPort, buildMessageEvent("msg-pbb-1", "test-spawn-pbb", "user-pbb-001", false, prompt, nil)); err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
 
-	// Prompt delivered: visible in the pane. The pane must show it even though
-	// no identity exists yet (the knob creates the row only on the prompt).
+	// The prompt is visible in the pane even though no transcript exists yet.
 	var paneTarget string
 	deadline := time.Now().Add(40 * time.Second)
 	for time.Now().Before(deadline) && paneTarget == "" {
-		for _, s := range listDpSessions() {
-			out, err := exec.Command("tmux", "capture-pane", "-t", s+":0.0", "-p").Output()
-			if err == nil && strings.Contains(string(out), prompt) {
+		for _, s := range listLlmSessions() {
+			if strings.Contains(capturePane(s+":0.0"), prompt) {
 				paneTarget = s + ":0.0"
 			}
 		}
@@ -782,40 +352,18 @@ func TestSpawn_PromptBeforeBind(t *testing.T) {
 	}
 	t.Logf("✓ prompt visible in pane %s", paneTarget)
 
-	// Bound from the created line: a thread must appear and name the session.
 	var threadID string
 	if err := waitForThreadCreation(t, mockPort, &threadID, 40*time.Second); err != nil {
 		t.Fatalf("thread not created after prompt-first delivery: %v", err)
 	}
 	t.Logf("✓ thread created: id=%s", threadID)
 
-	// Prompt delivered: present in the DB, under exactly the session named in
-	// the spawn's own stderr "created" line.
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
+	sessionID := waitForNewTranscript(t, projects, nil, 30*time.Second)
+	if err := waitForPrompt(t, projects, sessionID, prompt, 30*time.Second); err != nil {
+		t.Fatalf("prompt never landed in the transcript: %v", err)
 	}
-	defer db.Close()
-	var sessionID string
-	deadline = time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) && sessionID == "" {
-		db.QueryRow(`SELECT session_id FROM part WHERE data LIKE ? LIMIT 1`, "%"+prompt+"%").Scan(&sessionID)
-		time.Sleep(200 * time.Millisecond)
-	}
-	if sessionID == "" {
-		t.Fatal("prompt never landed in the DB")
-	}
-	logs, _ := filepath.Glob(filepath.Join(stateDir, "stderr-dp-*.log"))
-	if len(logs) != 1 {
-		t.Fatalf("expected one spawn stderr log, got %v", logs)
-	}
-	logData, _ := os.ReadFile(logs[0])
-	if !strings.Contains(string(logData), "message=created id="+sessionID) {
-		t.Fatalf("stderr log lacks created line for %s:\n%s", sessionID, logData)
-	}
-	t.Logf("✓ prompt in DB under %s, matching the created line", sessionID)
+	t.Logf("✓ prompt in the transcript of %s", sessionID)
 
-	// Reply mirrored into Discord, and the thread/root names the bound session.
 	if err := waitForMessageContent(t, mockPort, reply, 30*time.Second); err != nil {
 		t.Fatalf("reply not mirrored: %v", err)
 	}
@@ -825,84 +373,148 @@ func TestSpawn_PromptBeforeBind(t *testing.T) {
 	if err := waitForSessionRecord(stateDir, sessionID, 10*time.Second); err != nil {
 		t.Fatalf("session not recorded: %v", err)
 	}
-	t.Log("✓ reply mirrored; session bound from the created line")
+	t.Log("✓ reply mirrored; session bound by its llmux-chosen id")
+}
+
+// ── TestSpawn_TrustDialogApproval ────────────────────────────────────────────
+//
+// In a folder Claude Code does not trust yet, the TUI first shows "Quick safety
+// check ... ❯ No, exit". The relay must surface that to Discord as an approval
+// (never auto-accept), and Approve must trust the folder (Down, Enter) so the
+// spawn continues: the first prompt is delivered and the session is mirrored.
+func TestSpawn_TrustDialogApproval(t *testing.T) {
+	mustBin(t, "tmux")
+	mustBin(t, "llmux")
+	killLlmSessionsCleanup(t)
+	projects, stateDir := t.TempDir(), t.TempDir()
+	mockPort, mockGWPort := "19958", "19959"
+	setupMock(t, mockPort, mockGWPort)
+
+	const channel = "test-spawn-trust"
+	spawnRelay(t, projects, stateDir, mockPort, channel, "user-allowed-001", "FAKE_CLAUDE_UNTRUSTED=1")
+
+	waitForRelayReady(t, stateDir)
+	if err := dispatchEvent(mockPort, buildMessageEvent("msg-trust-1", channel, "user-allowed-001", false, "trust round trip prompt", nil)); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+
+	approveID := waitForComponentID(t, mockPort, "Trust this folder", 30*time.Second)
+
+	// Never auto-accepted: the dialog stays up and nothing is injected until approved.
+	time.Sleep(1500 * time.Millisecond)
+	var dialogPane string
+	for _, s := range listLlmSessions() {
+		if p := capturePane(s + ":0.0"); strings.Contains(p, "Quick safety check") {
+			dialogPane = s + ":0.0"
+		}
+	}
+	if dialogPane == "" {
+		t.Fatal("the trust dialog was dismissed without anyone approving it")
+	}
+	if ids := transcriptSessionIDs(projects); len(ids) != 0 {
+		t.Fatalf("a prompt was delivered before the folder was trusted: %v", ids)
+	}
+
+	if err := dispatchEvent(mockPort, interactionEvent("interaction-trust-001", channel, approveID, 2, nil)); err != nil {
+		t.Fatal(err)
+	}
+
+	var threadID string
+	if err := waitForThreadCreation(t, mockPort, &threadID, 40*time.Second); err != nil {
+		t.Fatalf("no thread after the folder was trusted: %v\npane:\n%s", err, capturePane(dialogPane))
+	}
+	sessionID := waitForNewTranscript(t, projects, nil, 30*time.Second)
+	if err := waitForPrompt(t, projects, sessionID, "trust round trip prompt", 30*time.Second); err != nil {
+		t.Fatalf("first prompt not delivered after trust: %v", err)
+	}
+	if err := waitForMessageContent(t, mockPort, "Folder trusted", 10*time.Second); err != nil {
+		t.Errorf("the approval message was not updated: %v", err)
+	}
+	if strings.Contains(capturePane(dialogPane), "Quick safety check") {
+		t.Error("the trust dialog is still on screen after approval")
+	}
+	t.Log("✓ trust dialog surfaced to Discord; Approve trusted the folder and the spawn continued")
+}
+
+// ── TestSpawn_TrustDialogDenied ──────────────────────────────────────────────
+//
+// Deny (Escape) must never trust the folder: the spawn fails closed, nothing is
+// injected, no thread is created, and the spawned session is torn down.
+func TestSpawn_TrustDialogDenied(t *testing.T) {
+	mustBin(t, "tmux")
+	mustBin(t, "llmux")
+	killLlmSessionsCleanup(t)
+	projects, stateDir := t.TempDir(), t.TempDir()
+	mockPort, mockGWPort := "19960", "19961"
+	setupMock(t, mockPort, mockGWPort)
+
+	const channel = "test-spawn-trustdeny"
+	spawnRelay(t, projects, stateDir, mockPort, channel, "user-allowed-001", "FAKE_CLAUDE_UNTRUSTED=1")
+
+	waitForRelayReady(t, stateDir)
+	if err := dispatchEvent(mockPort, buildMessageEvent("msg-trust-2", channel, "user-allowed-001", false, "must never be delivered", nil)); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	denyID := waitForComponentIDAt(t, mockPort, "Trust this folder", 1, 30*time.Second)
+	if err := dispatchEvent(mockPort, interactionEvent("interaction-trust-002", channel, denyID, 2, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForMessageContent(t, mockPort, "Trust denied", 10*time.Second); err != nil {
+		t.Fatalf("denial not recorded: %v", err)
+	}
+
+	time.Sleep(3 * time.Second)
+	if n := countThreads(mockPort); n != 0 {
+		t.Fatalf("a thread was created for a denied folder")
+	}
+	if ids := transcriptSessionIDs(projects); len(ids) != 0 {
+		t.Fatalf("a prompt reached a session whose folder was never trusted: %v", ids)
+	}
+	for _, s := range listLlmSessions() {
+		if p := capturePane(s + ":0.0"); strings.Contains(p, "must never be delivered") {
+			t.Fatalf("the prompt was typed into the untrusted session %s", s)
+		}
+	}
+	t.Log("✓ trust denied: no prompt, no thread, nothing trusted")
 }
 
 // ── TestSpawn_FailureTeardownSparesLiveSession ───────────────────────────────
 //
-// A spawn that fails identity must tear down only its own tmux session. A live,
+// A spawn that fails to bind must tear down only its own tmux session. A live,
 // bound session (its pane and its sessions.json record) must survive, and the
 // failure is announced exactly once.
 func TestSpawn_FailureTeardownSparesLiveSession(t *testing.T) {
 	mustBin(t, "tmux")
-	mustBin(t, "dpmux")
-	fakeDP := mustBin(t, "fake-devpass-code")
-	relayBin := mustBin(t, "relay")
-	mockDS := mustBin(t, "mock-discord")
-	killDpSessionsCleanup(t)
-
-	xdgHome := t.TempDir()
-	stateDir := t.TempDir()
-	dbPath := filepath.Join(xdgHome, "devpass-code", "opencode.db")
-
+	mustBin(t, "llmux")
+	killLlmSessionsCleanup(t)
+	projects, stateDir := t.TempDir(), t.TempDir()
 	mockPort, mockGWPort := "19942", "19943"
-	startMockDiscord(t, mockDS, mockPort, mockGWPort)
-	if err := waitForHTTP(fmt.Sprintf("http://127.0.0.1:%s/api/v10/gateway", mockPort), 5*time.Second); err != nil {
-		t.Fatalf("mock-discord not ready: %v", err)
-	}
+	setupMock(t, mockPort, mockGWPort)
 
-	// Live, bound session: a running fake CLI whose row exists and whose record
-	// is in sessions.json with a thread.
-	const liveName = "dp-live-spare-001"
-	if out, err := exec.Command("tmux", "new-session", "-d", "-s", liveName, "-x", "200", "-y", "50",
-		"env", "XDG_DATA_HOME="+xdgHome, fakeDP, "--auto").CombinedOutput(); err != nil {
-		t.Fatalf("start live session: %v\n%s", err, out)
-	}
-	livePane := liveName + ":0.0"
-	if err := waitForPaneText(t, livePane, "Ask anything", 10*time.Second); err != nil {
+	// Live, bound session: a running fake CLI with a transcript, recorded in
+	// sessions.json with a thread.
+	const liveName = "llm-live-spare-001"
+	liveID := testSID(53)
+	livePane := startFakePane(t, liveName, projects, nil, "--session-id", liveID)
+	waitForPaneReady(t, livePane, 10*time.Second)
+	submitInPane(t, livePane, "live session prompt")
+	if err := waitForPrompt(t, projects, liveID, "live session prompt", 10*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	var liveID string
-	if err := waitForSessionRow(t, db, &liveID, 10*time.Second); err != nil {
-		t.Fatal(err)
-	}
-	sessionsJSON := fmt.Sprintf(`[{"session_id":%q,"tmux_target":%q,"thread_id":"thread-live-001","thread_root_id":"root-live-001","channel_id":"test-spawn-tdown","status":"active"}]`, liveID, livePane)
-	if err := os.WriteFile(filepath.Join(stateDir, "sessions.json"), []byte(sessionsJSON), 0644); err != nil {
-		t.Fatal(err)
-	}
+	writeSessionsJSON(t, stateDir, liveID, livePane, "thread-live-001", "test-spawn-tdown")
 
-	// The spawned CLI is ready and accepts input but never logs a created id.
-	stub := filepath.Join(t.TempDir(), "stub-never-creates")
-	stubBody := "#!/bin/sh\necho 'Ask anything...'\ncat >/dev/null\n"
+	// The spawned CLI looks ready and accepts input but never writes a transcript.
+	stub := filepath.Join(t.TempDir(), "stub-never-writes")
+	stubBody := "#!/bin/sh\nprintf '\\n────────────────────\\n❯ \\n────────────────────\\n  ? for shortcuts\\n'\ncat >/dev/null\n"
 	if err := os.WriteFile(stub, []byte(stubBody), 0755); err != nil {
 		t.Fatal(err)
 	}
-
-	relayCmd := exec.Command(relayBin)
-	relayCmd.Env = append(os.Environ(),
-		"DISCORD_TOKEN=test-token",
-		"DISCORD_CHANNEL_ID=test-spawn-tdown",
-		fmt.Sprintf("DISCORD_API_URL=http://127.0.0.1:%s", mockPort),
-		fmt.Sprintf("RELAY_DEVPASS_DB=%s", dbPath),
-		fmt.Sprintf("RELAY_STATE_DIR=%s", stateDir),
-		"DISCORD_USER_ID=user-tdown-001",
-		fmt.Sprintf("RELAY_DEVPASS_BIN=%s", stub),
-		"RELAY_SPAWN_BIND_TIMEOUT_MS=3000",
-	)
-	relayCmd.Stdout = io.Discard
-	relayCmd.Stderr = os.Stderr
-	if err := relayCmd.Start(); err != nil {
-		t.Fatalf("start relay: %v", err)
-	}
-	t.Cleanup(func() { relayCmd.Process.Kill() })
+	startRelay(t, mustBin(t, "relay"), projects, stateDir, mockPort,
+		"DISCORD_CHANNEL_ID=test-spawn-tdown", "DISCORD_USER_ID=user-tdown-001",
+		"RELAY_AGENT_CMD="+stub, "RELAY_SPAWN_BIND_TIMEOUT_MS=3000")
 
 	waitForRelayReady(t, stateDir)
-	if err := dispatchEvent(mockPort, buildMessageEvent("msg-tdown-1", "test-spawn-tdown", "user-tdown-001", false, "teardown: this spawn fails identity", nil)); err != nil {
+	if err := dispatchEvent(mockPort, buildMessageEvent("msg-tdown-1", "test-spawn-tdown", "user-tdown-001", false, "teardown: this spawn never binds", nil)); err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
 
@@ -910,7 +522,7 @@ func TestSpawn_FailureTeardownSparesLiveSession(t *testing.T) {
 	var spawnName string
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) && spawnName == "" {
-		for _, s := range listDpSessions() {
+		for _, s := range listLlmSessions() {
 			if s != liveName {
 				spawnName = s
 			}
@@ -918,20 +530,17 @@ func TestSpawn_FailureTeardownSparesLiveSession(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	if spawnName == "" {
-		t.Fatal("no spawned dp- session ever appeared")
+		t.Fatal("no spawned llm- session ever appeared")
 	}
 	t.Logf("failed spawn session: %s", spawnName)
 
 	// Exactly one failure notice (wait for it, then let any duplicate settle).
-	const notice = "Could not start a new devpass-code session"
+	const notice = "Could not start a new Claude Code session"
 	if err := waitForMessageContent(t, mockPort, notice, 40*time.Second); err != nil {
 		t.Fatalf("no failure notice posted: %v", err)
 	}
 	time.Sleep(1500 * time.Millisecond)
-	msgs, err := getSentMessages(mockPort)
-	if err != nil {
-		t.Fatal(err)
-	}
+	msgs, _ := getSentMessages(mockPort)
 	notices := 0
 	for _, m := range msgs {
 		if strings.Contains(contentOf(m), notice) {
@@ -942,21 +551,20 @@ func TestSpawn_FailureTeardownSparesLiveSession(t *testing.T) {
 		t.Fatalf("expected exactly one failure notice, got %d", notices)
 	}
 
-	// The failed spawn's pane is gone.
 	if err := exec.Command("tmux", "has-session", "-t", "="+spawnName).Run(); err == nil {
 		t.Fatalf("failed spawn session %s still running after teardown", spawnName)
 	}
-
-	// The live session's pane and record survive.
 	if err := exec.Command("tmux", "has-session", "-t", "="+liveName).Run(); err != nil {
 		t.Fatalf("live session %s was killed by the failed spawn's teardown", liveName)
 	}
-	out, err := exec.Command("tmux", "capture-pane", "-t", livePane, "-p").Output()
-	if err != nil || !strings.Contains(string(out), "Ask anything") {
-		t.Fatalf("live pane damaged: err=%v capture=%q", err, out)
+	if !strings.Contains(capturePane(livePane), "❯") {
+		t.Fatalf("live pane damaged: %q", capturePane(livePane))
 	}
 	if err := waitForSessionRecord(stateDir, liveID, 2*time.Second); err != nil {
 		t.Fatalf("live session record removed from sessions.json: %v", err)
 	}
-	t.Log("✓ live pane + record survive; failed spawn pane gone; one notice")
+	if n := countThreads(mockPort); n != 0 {
+		t.Fatalf("a failed spawn created %d thread(s)", n)
+	}
+	t.Log("✓ live pane + record survive; failed spawn pane gone; one notice; no thread")
 }

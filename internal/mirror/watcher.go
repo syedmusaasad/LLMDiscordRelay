@@ -296,32 +296,58 @@ func (p *pendingInteractionStore) has(threadID, target, kind string) bool {
 	return false
 }
 
-// suppressedEchoStore tracks prompt texts that have already been echoed to
-// Discord for a given session, so the retry path can suppress duplicates.
+// echoSuppressWindow is how long after a retried injection a duplicate echo of
+// the same prompt is still suppressed.
+const echoSuppressWindow = 2 * time.Minute
+
+// suppressedEchoStore de-duplicates the "You: ..." echo of a prompt the relay
+// had to inject twice. injectAndVerify arms an entry before the retry; the
+// FIRST transcript event for that text is still posted (the first send may have
+// been lost, so it can be the only one), and only a SECOND event for the same
+// text is suppressed. An entry that never sees a duplicate expires, so a later,
+// genuinely repeated prompt is not swallowed.
 type suppressedEchoStore struct {
 	mu      sync.Mutex
-	entries map[string]map[string]bool // sessionID -> set of prompt texts
+	entries map[string]map[string]*echoEntry // sessionID -> prompt text -> state
 }
 
+type echoEntry struct {
+	armed  time.Time
+	posted bool // the first echo has been let through
+}
+
+// add arms duplicate suppression for prompt in sessionID.
 func (s *suppressedEchoStore) add(sessionID, prompt string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.entries == nil {
-		s.entries = make(map[string]map[string]bool)
+		s.entries = make(map[string]map[string]*echoEntry)
 	}
 	if s.entries[sessionID] == nil {
-		s.entries[sessionID] = make(map[string]bool)
+		s.entries[sessionID] = make(map[string]*echoEntry)
 	}
-	s.entries[sessionID][prompt] = true
+	s.entries[sessionID][prompt] = &echoEntry{armed: time.Now()}
 }
 
-func (s *suppressedEchoStore) has(sessionID, prompt string) bool {
+// suppress reports whether the echo for prompt just seen in sessionID is a
+// duplicate that must not be posted. Call it once per prompt event.
+func (s *suppressedEchoStore) suppress(sessionID, prompt string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.entries == nil {
+	e := s.entries[sessionID][prompt]
+	if e == nil {
 		return false
 	}
-	return s.entries[sessionID][prompt]
+	if time.Since(e.armed) > echoSuppressWindow {
+		delete(s.entries[sessionID], prompt)
+		return false
+	}
+	if !e.posted {
+		e.posted = true
+		return false
+	}
+	delete(s.entries[sessionID], prompt)
+	return true
 }
 
 // claimSet is a thread-safe set of claimed session IDs.
@@ -776,7 +802,7 @@ func (w *Watcher) mirrorEvent(sessionID, threadID string, ev transcript.Event,
 		// prompt (because it had to retry the injection), skip the second
 		// Discord post.  Use the raw text for the suppression key (before
 		// truncation) so the check is length-invariant.
-		if w.suppressedEchoes.has(sessionID, ev.Text) {
+		if w.suppressedEchoes.suppress(sessionID, ev.Text) {
 			log.Printf("mirror: suppressed duplicate echo for session %s", sessionID)
 			return
 		}

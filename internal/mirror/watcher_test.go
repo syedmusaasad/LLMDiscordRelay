@@ -479,3 +479,26 @@ func TestWaitForTranscriptDeadPaneWithExistingTranscriptFails(t *testing.T) {
 		t.Errorf("err = %v, want pane-died error", err)
 	}
 }
+
+// A prompt the relay had to inject twice is echoed to Discord exactly once: the
+// first transcript event is posted (the first send may have been lost, leaving
+// it as the only one) and only a second event is suppressed.
+func TestSuppressedEchoStore_FirstEchoPostedDuplicateSuppressed(t *testing.T) {
+	var s suppressedEchoStore
+	if s.suppress("sess", "hello") {
+		t.Fatal("an unarmed prompt must never be suppressed")
+	}
+	s.add("sess", "hello")
+	if s.suppress("other", "hello") {
+		t.Fatal("suppression leaked to another session")
+	}
+	if s.suppress("sess", "hello") {
+		t.Fatal("the first echo after a retry must still be posted")
+	}
+	if !s.suppress("sess", "hello") {
+		t.Fatal("the duplicate echo must be suppressed")
+	}
+	if s.suppress("sess", "hello") {
+		t.Fatal("a later, genuinely repeated prompt must be posted")
+	}
+}

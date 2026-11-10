@@ -29,6 +29,9 @@
 //	FAKE_CLAUDE_SWALLOW_UNTIL_READY=1   discard keys typed before the idle pane
 //	FAKE_CLAUDE_TRANSCRIPT_DELAY_MS=<n> delay before the transcript file is created
 //	FAKE_CLAUDE_REFUSE_FIRST_RESUME=1   refuse every --resume (even a known id)
+//	FAKE_CLAUDE_DROP_FIRST_PROMPT=1     lose the first submitted prompt (nothing is
+//	                                    shown or recorded), like a keystroke eaten
+//	                                    by a TUI that was not listening yet
 //	FAKE_CLAUDE_PERMISSION_PROMPT=1     one permission prompt in the first turn
 //	FAKE_CLAUDE_PERMISSION_PROMPTS=<n>  n permission prompts in the first turn
 //	FAKE_CLAUDE_QUESTION_PICKER=1       an AskUserQuestion picker in the first turn
@@ -309,6 +312,7 @@ type session struct {
 	counter  int
 	script   []scriptTurn
 	turnIdx  int
+	dropped  bool // the FAKE_CLAUDE_DROP_FIRST_PROMPT prompt has been lost
 }
 
 func (s *session) draw(frame string) { fmt.Print("\x1b[2J\x1b[H" + frame) }
@@ -444,6 +448,10 @@ func (s *session) trustDialog() bool {
 
 // turn runs one scripted turn for prompt.
 func (s *session) turn(prompt string) error {
+	if os.Getenv("FAKE_CLAUDE_DROP_FIRST_PROMPT") == "1" && !s.dropped {
+		s.dropped = true
+		return nil
+	}
 	started := time.Now()
 	if d := envMS("FAKE_CLAUDE_TRANSCRIPT_DELAY_MS"); d > 0 && s.path == "" {
 		time.Sleep(d)

@@ -46,12 +46,12 @@ COPY --chown=testuser:testuser . .
 
 RUN chmod 0755 test/integration/with-user-manager.sh
 
-# Pre-build test binaries + fake-devpass-code for PATH
+# Pre-build test binaries + fake-claude for PATH
 RUN mkdir -p /home/testuser/bin && \
-    CGO_ENABLED=0 go build -o /home/testuser/bin/fake-devpass-code ./cmd/fake-devpass-code && \
+    CGO_ENABLED=0 go build -o /home/testuser/bin/fake-claude ./cmd/fake-claude && \
     CGO_ENABLED=0 go build -o /home/testuser/bin/mock-discord ./cmd/mock-discord && \
     CGO_ENABLED=0 go build -o /home/testuser/bin/relay ./cmd/relay && \
-    CGO_ENABLED=0 go build -o /home/testuser/bin/dpmux ./cmd/dpmux
+    CGO_ENABLED=0 go build -o /home/testuser/bin/llmux ./cmd/llmux
 
 ENV PATH="/home/testuser/bin:${PATH}"
 
