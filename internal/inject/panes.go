@@ -68,9 +68,12 @@ func IsPermissionPrompt(pane string) bool {
 }
 
 // PermissionSignature identifies one permission prompt for de-duplication: the
-// command/action text shown above "Do you want to proceed?", back to the
-// nearest full-width rule, without the dashed ╌╌╌ rules or blank lines.
-// It is empty when the pane has no permission prompt.
+// action block shown between the two dashed ╌╌╌ rules above the "Do you want
+// to ...?" heading (blank lines dropped). Nothing outside those rules, such as
+// the conversation above the dialog, is part of the signature, so a redraw
+// that only moves or changes the history keeps it stable. Prompts drawn
+// without dashed rules fall back to the text between the heading and the
+// nearest full-width rule. It is empty when the pane has no permission prompt.
 func PermissionSignature(pane string) string {
 	pane = normalize(pane)
 	if !IsPermissionPrompt(pane) {
@@ -86,15 +89,26 @@ func PermissionSignature(pane string) string {
 	if heading < 0 {
 		return ""
 	}
-	var block []string
+	// The closing dashed rule is the nearest one above the heading, provided no
+	// full-width rule (the top of the dialog) comes first.
+	start := heading - 1
 	for i := heading - 1; i >= 0; i-- {
 		if isRule(lines[i]) {
 			break
 		}
-		if isDashedRule(lines[i]) || strings.TrimSpace(lines[i]) == "" {
-			continue
+		if isDashedRule(lines[i]) {
+			start = i - 1
+			break
 		}
-		block = append([]string{strings.TrimSpace(lines[i])}, block...)
+	}
+	var block []string
+	for i := start; i >= 0; i-- {
+		if isRule(lines[i]) || isDashedRule(lines[i]) {
+			break
+		}
+		if t := strings.TrimSpace(lines[i]); t != "" {
+			block = append([]string{t}, block...)
+		}
 	}
 	return strings.Join(block, "\n")
 }

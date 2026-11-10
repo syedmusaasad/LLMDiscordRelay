@@ -169,6 +169,37 @@ func TestPermissionPrompt(t *testing.T) {
 	}
 }
 
+// TestPermissionSignatureIgnoresHistory: the signature is the action block
+// between the dashed rules only, so identical actions with different
+// conversation above the dialog share a signature and none of that history
+// leaks into it.
+func TestPermissionSignatureIgnoresHistory(t *testing.T) {
+	dash := strings.Repeat("╌", 72)
+	dialog := func(history string) string {
+		return history + "\n" + rule + "\n Bash command\n" + dash + "\n   rm hello.txt && ls -la\n   Remove hello.txt\n" + dash +
+			"\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n\n Esc to cancel\n"
+	}
+	a := dialog("● Earlier answer about unrelated things\n  and a second history line")
+	b := dialog("● A completely different, much longer history\n" + strings.Repeat("  filler line\n", 40))
+	sa, sb := PermissionSignature(a), PermissionSignature(b)
+	if sa == "" || sa != sb {
+		t.Fatalf("signatures differ across history: %q vs %q", sa, sb)
+	}
+	if want := "rm hello.txt && ls -la\nRemove hello.txt"; sa != want {
+		t.Fatalf("signature = %q, want %q", sa, want)
+	}
+	for _, leak := range []string{"Earlier", "history", "filler", "Bash command", "╌", "Do you want"} {
+		if strings.Contains(sa+sb, leak) {
+			t.Fatalf("signature contains %q: %q", leak, sa)
+		}
+	}
+	// History above with no full-width rule before the dialog must not leak either.
+	c := "● history without a rule\n" + dash + "\n   ls /tmp\n" + dash + "\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel\n"
+	if got := PermissionSignature(c); got != "ls /tmp" {
+		t.Fatalf("signature = %q, want only the action block", got)
+	}
+}
+
 func TestParseQuestion(t *testing.T) {
 	q, ok := ParseQuestion(questionPane)
 	if !ok {

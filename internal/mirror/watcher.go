@@ -240,6 +240,32 @@ func (p *pendingInteractionStore) take(id string) (pendingInteraction, bool) {
 	return entry, ok
 }
 
+// retire removes every pending entry of (thread, target, kind) that is not
+// keyed by the prompt currently on the pane: all of them when the pane shows no
+// such prompt (showing=false), otherwise those whose signature differs from
+// signature. It returns one entry per Discord message so the caller can mark
+// the message expired.
+func (p *pendingInteractionStore) retire(threadID, target, kind string, showing bool, signature string) []pendingInteraction {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var out []pendingInteraction
+	seenMsg := make(map[string]bool)
+	for id, entry := range p.entries {
+		if entry.threadID != threadID || entry.target != target || entry.kind != kind {
+			continue
+		}
+		if showing && entry.signature == signature {
+			continue
+		}
+		delete(p.entries, id)
+		if !seenMsg[entry.messageID] {
+			seenMsg[entry.messageID] = true
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
 func (p *pendingInteractionStore) has(threadID, target, kind string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -423,7 +449,14 @@ type spawnMarkerJSON struct {
 	// Resume marks a marker for `claude --resume <id>`: the transcript already
 	// exists, and a pane that is not (yet) alive is expected.
 	Resume bool `json:"resume,omitempty"`
+	// Owner is non-empty when a relay spawn path (handleSpawnFromDiscord,
+	// spawnResume) launched llmux and therefore owns the marker: it decides
+	// bind, timeout and cleanup. scanSessions never claims an owned marker.
+	Owner string `json:"owner,omitempty"`
 }
+
+// markerOwnerSpawn is the Owner value llmux records for the relay's own spawn paths.
+const markerOwnerSpawn = "relay-spawn"
 
 // staleMarkerAge is how old a marker must be before scanSessions may delete it
 // for being orphaned (dead pane, or session already tracked).
@@ -466,12 +499,22 @@ func readPendingMarkers(stateDir string) []pendingMarker {
 	return out
 }
 
-// scanSessions pairs pending markers with transcripts. A marker whose session
+// scanSessions pairs pending markers with transcripts. Markers owned by a relay
+// spawn path (Owner set) are left alone. A marker whose session
 // id already has a transcript (the first prompt was submitted) is claimed and
 // mirrored; a new-spawn marker additionally needs its pane alive.
 func (w *Watcher) scanSessions(ctx context.Context, seen map[string]bool) {
 	for _, m := range readPendingMarkers(w.cfg.StateDir) {
 		old := !m.mod.IsZero() && time.Since(m.mod) > staleMarkerAge
+		if m.Owner != "" {
+			// Exactly one owner per marker: the spawn path that launched it
+			// decides bind, bind timeout and cleanup. The scanner only sweeps
+			// markers whose owner is long gone (dead pane).
+			if old && !isTmuxPaneAlive(m.Target) {
+				os.Remove(m.path)
+			}
+			continue
+		}
 		if seen[m.SessionID] {
 			if old {
 				// Tracked via sessions.json but never re-attached: the marker is spent.
@@ -648,8 +691,7 @@ func (w *Watcher) mirrorContent(parent context.Context, sessionID, threadID, tmu
 	// no blocking transcript part (docs/TRANSCRIPT-SCHEMA.md).
 	paneTicker := time.NewTicker(250 * time.Millisecond)
 	defer paneTicker.Stop()
-	approvalSignature := ""
-	questionSignature := ""
+	var prompts promptTracker
 
 	sendTyping := func() {
 		if err := w.discord.SendTyping(threadID); err != nil {
@@ -683,28 +725,7 @@ func (w *Watcher) mirrorContent(parent context.Context, sessionID, threadID, tmu
 			if captureErr != nil {
 				continue
 			}
-			if inject.IsPermissionPrompt(pane) {
-				signature := inject.PermissionSignature(pane)
-				if !w.pendingInteractions.has(threadID, tmuxTarget, "approval") &&
-					(signature != approvalSignature || w.pendingInteractions.settled(threadID, tmuxTarget, "approval", interactionGrace)) {
-					if w.postApproval(threadID, tmuxTarget, signature) {
-						approvalSignature = signature
-					}
-				}
-			} else {
-				approvalSignature = ""
-			}
-			if q, ok := inject.ParseQuestion(pane); ok {
-				signature := questionSignatureOf(q)
-				if !w.pendingInteractions.has(threadID, tmuxTarget, "question") &&
-					(signature != questionSignature || w.pendingInteractions.settled(threadID, tmuxTarget, "question", interactionGrace)) {
-					if w.postQuestion(threadID, tmuxTarget, q) {
-						questionSignature = signature
-					}
-				}
-			} else {
-				questionSignature = ""
-			}
+			w.pollPrompts(threadID, tmuxTarget, pane, &prompts)
 
 		case ev, ok := <-ch:
 			if !ok {
@@ -1099,6 +1120,81 @@ func isTmuxPaneAlive(target string) bool {
 	return err == nil
 }
 
+// promptTracker is mirrorContent's per-session memory of the prompts it posted.
+type promptTracker struct {
+	approval, question string // signature of the last prompt posted
+	approvalMissing    int    // consecutive polls without a permission prompt
+	questionMissing    int    // consecutive polls without a question picker
+}
+
+// promptAbsentPolls is how many consecutive pane polls must lack a prompt
+// before its pending interaction is retired (rides out a torn redraw).
+const promptAbsentPolls = 2
+
+// pollPrompts runs one pane poll for approvals and questions. Invariants, shared
+// with the trust dialog: a pending interaction is keyed by the exact prompt
+// signature, retired when the pane stops showing that prompt or shows a
+// different one, and times out (postApproval/postQuestion/askTrust).
+func (w *Watcher) pollPrompts(threadID, target, pane string, tr *promptTracker) {
+	apShow := inject.IsPermissionPrompt(pane)
+	apSig := ""
+	if apShow {
+		apSig = inject.PermissionSignature(pane)
+		tr.approvalMissing = 0
+	} else {
+		tr.approvalMissing++
+	}
+	if apShow || tr.approvalMissing >= promptAbsentPolls {
+		w.retireInteractions(threadID, target, "approval", apShow, apSig)
+	}
+	if apShow {
+		if !w.pendingInteractions.has(threadID, target, "approval") &&
+			(apSig != tr.approval || w.pendingInteractions.settled(threadID, target, "approval", interactionGrace)) {
+			if w.postApproval(threadID, target, apSig) {
+				tr.approval = apSig
+			}
+		}
+	} else {
+		tr.approval = ""
+	}
+
+	q, qShow := inject.ParseQuestion(pane)
+	qSig := ""
+	if qShow {
+		qSig = questionSignatureOf(q)
+		tr.questionMissing = 0
+	} else {
+		tr.questionMissing++
+	}
+	if qShow || tr.questionMissing >= promptAbsentPolls {
+		w.retireInteractions(threadID, target, "question", qShow, qSig)
+	}
+	if qShow {
+		if !w.pendingInteractions.has(threadID, target, "question") &&
+			(qSig != tr.question || w.pendingInteractions.settled(threadID, target, "question", interactionGrace)) {
+			if w.postQuestion(threadID, target, q) {
+				tr.question = qSig
+			}
+		}
+	} else {
+		tr.question = ""
+	}
+}
+
+// retireInteractions drops the pending interactions the pane no longer shows
+// and marks their Discord messages expired.
+func (w *Watcher) retireInteractions(threadID, target, kind string, showing bool, signature string) {
+	for _, entry := range w.pendingInteractions.retire(threadID, target, kind, showing, signature) {
+		text := "⌛ **Permission request expired** (the prompt is no longer on screen)."
+		if kind == "question" {
+			text = "⌛ **Question expired** (the picker is no longer on screen)."
+		}
+		if err := w.discordEditComponents(entry.threadID, entry.messageID, text, nil); err != nil {
+			log.Printf("mirror: edit retired %s: %v", kind, err)
+		}
+	}
+}
+
 // postApproval posts the Approve/Deny buttons for a permission prompt. It
 // reports whether the message was delivered; callers must only remember the
 // prompt signature on success so a failed post is retried on the next poll.
@@ -1170,7 +1266,32 @@ func (w *Watcher) postQuestion(threadID, target string, q inject.Question) bool 
 		return false
 	}
 	w.pendingInteractions.clearResolved(threadID, target, "question")
-	w.pendingInteractions.put(id, pendingInteraction{target: target, threadID: threadID, messageID: msg.ID, kind: "question", options: len(q.Options), signature: questionSignatureOf(q)})
+	entry := pendingInteraction{target: target, threadID: threadID, messageID: msg.ID, kind: "question", options: len(q.Options), signature: questionSignatureOf(q)}
+	w.pendingInteractions.put(id, entry)
+	go func() {
+		timer := time.NewTimer(w.cfg.ApprovalTimeout)
+		defer timer.Stop()
+		select {
+		case <-w.runCtx.Done():
+		case <-timer.C:
+			if _, ok := w.pendingInteractions.take(id); !ok {
+				return // answered or retired meanwhile
+			}
+			w.pendingInteractions.markResolved(threadID, target, "question")
+			note := "⌛ **Question expired** (the prompt is no longer on screen)."
+			if w.paneStillShows(entry) {
+				// Nobody answered: cancel the picker rather than leave the
+				// session blocked and the thread's next question suppressed.
+				if err := tmuxctl.SendRecipe(target, tmuxctl.QuestionCancelRecipe); err != nil {
+					log.Printf("mirror: question timeout cancel: %v", err)
+				}
+				note = "⌛ **Question timed out** (no answer; the picker was cancelled)."
+			}
+			if err := w.discordEditComponents(threadID, msg.ID, note, nil); err != nil {
+				log.Printf("mirror: edit timed-out question: %v", err)
+			}
+		}
+	}()
 	return true
 }
 
@@ -1195,6 +1316,8 @@ func (w *Watcher) paneStillShows(entry pendingInteraction) bool {
 	case "question":
 		q, ok := inject.ParseQuestion(pane)
 		return ok && questionSignatureOf(q) == entry.signature
+	case "trust":
+		return inject.IsTrustDialog(pane)
 	}
 	return false
 }
@@ -1219,7 +1342,7 @@ func (w *Watcher) askTrust(ctx context.Context, target, channelID string) bool {
 		return false
 	}
 	result := make(chan bool, 1)
-	entry := pendingInteraction{target: target, threadID: channelID, messageID: msg.ID, kind: "trust", result: result}
+	entry := pendingInteraction{target: target, threadID: channelID, messageID: msg.ID, kind: "trust", signature: trustSignature, result: result}
 	w.pendingInteractions.put(approveID, entry)
 	w.pendingInteractions.put(denyID, entry)
 
@@ -1234,21 +1357,53 @@ func (w *Watcher) askTrust(ctx context.Context, target, channelID string) bool {
 		}
 		return false
 	}
-	select {
-	case ok := <-result:
-		return ok
-	case <-timeout.C:
-		if _, ok := w.pendingInteractions.take(approveID); !ok {
-			return <-result // an interaction won the race
+	// Retire the request when the pane stops showing the dialog (answered in the
+	// terminal): the buttons would otherwise act on whatever is on screen next.
+	watch := time.NewTicker(trustWatchInterval)
+	defer watch.Stop()
+	absent := 0
+	for {
+		select {
+		case ok := <-result:
+			return ok
+		case <-watch.C:
+			if w.paneStillShows(entry) {
+				absent = 0
+				continue
+			}
+			if absent++; absent < promptAbsentPolls {
+				continue
+			}
+			if _, ok := w.pendingInteractions.take(approveID); !ok {
+				return <-result // a click is being handled
+			}
+			w.pendingInteractions.take(denyID)
+			if err := w.discordEditComponents(channelID, msg.ID, "⌛ **Trust request expired** (the dialog is no longer on screen).", nil); err != nil {
+				log.Printf("mirror: edit retired trust approval: %v", err)
+			}
+			// Answered in the terminal: awaitReady keeps polling and sees whether
+			// the pane became ready or exited.
+			return true
+		case <-timeout.C:
+			if _, ok := w.pendingInteractions.take(approveID); !ok {
+				return <-result // an interaction won the race
+			}
+			w.pendingInteractions.take(denyID)
+			return deny("⛔ **Trust denied automatically** (approval timeout).")
+		case <-ctx.Done():
+			w.pendingInteractions.take(approveID)
+			w.pendingInteractions.take(denyID)
+			return deny("⛔ **Trust request cancelled.**")
 		}
-		w.pendingInteractions.take(denyID)
-		return deny("⛔ **Trust denied automatically** (approval timeout).")
-	case <-ctx.Done():
-		w.pendingInteractions.take(approveID)
-		w.pendingInteractions.take(denyID)
-		return deny("⛔ **Trust request cancelled.**")
 	}
 }
+
+// trustSignature keys the trust dialog's pending interaction: the dialog has
+// no variable content, so any pane showing it is "the same prompt".
+const trustSignature = "trust-dialog"
+
+// trustWatchInterval is how often askTrust re-checks that the dialog is still up.
+const trustWatchInterval = 500 * time.Millisecond
 
 func (w *Watcher) handleInteraction(ev InteractionEvent) {
 	if err := w.discord.AcknowledgeInteraction(ev); err != nil {
@@ -1633,6 +1788,9 @@ func (w *Watcher) llmuxEnv() []string {
 	if w.cfg.ProjectsRoot != "" {
 		env = setEnvVar(env, "RELAY_CLAUDE_PROJECTS", w.cfg.ProjectsRoot)
 	}
+	// Every llmux launched by the relay is owned by the launching code path,
+	// which binds (or tears down) it itself; the scanner must not claim it.
+	env = setEnvVar(env, "RELAY_MARKER_OWNER", markerOwnerSpawn)
 	// Unset TMUX so llmux always creates a fresh tmux session (never new-window
 	// in the relay's own session if the relay runs inside tmux).
 	return setEnvVar(env, "TMUX", "")

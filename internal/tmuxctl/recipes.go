@@ -26,6 +26,10 @@ var TrustAcceptRecipe = KeyRecipe{"Down", "Enter"}
 // verified against Claude Code 2.1.319
 var TrustDenyRecipe = KeyRecipe{"Escape"}
 
+// QuestionCancelRecipe dismisses an AskUserQuestion picker ("Esc to cancel").
+// verified against Claude Code 2.1.319 (picker footer: "Esc to cancel")
+var QuestionCancelRecipe = KeyRecipe{"Escape"}
+
 // QuestionSelectRecipe moves from the first option of an AskUserQuestion picker
 // to the wanted one (Down repeated) and confirms with Enter.
 // verified against Claude Code 2.1.319

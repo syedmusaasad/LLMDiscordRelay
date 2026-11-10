@@ -30,6 +30,9 @@
 //	RELAY_STATE_DIR        state dir (default: ~/.llm-discord-relay)
 //	RELAY_CLAUDE_PROJECTS  Claude Code projects dir (forwarded to the agent
 //	                       process; the relay reads transcripts from it)
+//	RELAY_MARKER_OWNER     recorded in the pending marker as "owner"; the relay's
+//	                       own spawn paths set it so its marker scanner never
+//	                       claims their markers
 package main
 
 import (
@@ -288,6 +291,7 @@ type pendingMarker struct {
 	SpawnInstant int64  `json:"spawnInstant"`     // time.Now().UnixMilli() when marker was written
 	SessionID    string `json:"sessionID"`        // Claude Code session id of this launch
 	Resume       bool   `json:"resume,omitempty"` // true for `--resume <id>`: the transcript already exists
+	Owner        string `json:"owner,omitempty"`  // $RELAY_MARKER_OWNER: set when the relay's own spawn path owns the marker; the scanner never claims it
 }
 
 // launchPlan is what llmux will run for one invocation.
@@ -393,6 +397,7 @@ func runLaunch(args []string) error {
 				SpawnInstant: time.Now().UnixMilli(),
 				SessionID:    plan.SessionID,
 				Resume:       plan.Resume,
+				Owner:        os.Getenv("RELAY_MARKER_OWNER"),
 			}
 			if err := writePendingMarker(pendingPath, marker); err != nil {
 				return fmt.Errorf("write pending marker: %w", err)
@@ -426,6 +431,7 @@ func runLaunch(args []string) error {
 		SpawnInstant: time.Now().UnixMilli(),
 		SessionID:    plan.SessionID,
 		Resume:       plan.Resume,
+		Owner:        os.Getenv("RELAY_MARKER_OWNER"),
 	}
 	if err := writePendingMarker(pendingPath, marker); err != nil {
 		return fmt.Errorf("write pending marker: %w", err)
