@@ -2,7 +2,7 @@
 
 Release history for LLMDiscordRelay.
 
-## [1.0.0] - 2026-11-08
+## [1.0.0] - 2026-11-10
 
 ### Changed
 - Renamed project from DevPassDiscordRelay to LLMDiscordRelay.

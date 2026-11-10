@@ -30,7 +30,12 @@ func TestRenderersMatchTheRelaysParsers(t *testing.T) {
 	if !inject.IsPermissionPrompt(perm) || inject.PaneReady(perm) {
 		t.Fatalf("permission frame:\n%s", perm)
 	}
-	if sig := inject.PermissionSignature(perm); sig != "Bash command\nls -la\nList files" {
+	// Main path: the signature is exactly the action block between the two
+	// dashed rules, not the fallback text between the heading and the top rule.
+	if strings.Count(perm, dashRule) != 2 {
+		t.Fatalf("permission frame needs two dashed rules:\n%s", perm)
+	}
+	if sig := inject.PermissionSignature(perm); sig != "ls -la\nList files" {
 		t.Fatalf("signature = %q", sig)
 	}
 	q, ok := inject.ParseQuestion(renderQuestion("/work/demo", nil, "Color", "Which color do you prefer?", []string{"Red", "Green"}, 0))

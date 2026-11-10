@@ -127,9 +127,11 @@ func renderPermission(cwd string, history []string, command, description string,
 		b.WriteString(h + "\n")
 	}
 	b.WriteString("\n" + rule + "\n")
-	b.WriteString(" Bash command\n\n")
+	b.WriteString(" Bash command\n")
+	b.WriteString(dashRule + "\n")
 	b.WriteString("   " + command + "\n")
-	b.WriteString("   " + description + "\n\n")
+	b.WriteString("   " + description + "\n")
+	b.WriteString(dashRule + "\n")
 	b.WriteString(" Do you want to proceed?\n")
 	b.WriteString(row(0, "1. Yes") + "\n")
 	b.WriteString(row(1, "2. Yes, and always allow access to "+filepath.Base(cwd)+"/ from this project") + "\n")

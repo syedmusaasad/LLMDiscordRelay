@@ -154,7 +154,8 @@ func runRelay(ctx context.Context) error {
 	return nil
 }
 
-const relayVersion = "dev"
+// relayVersion is set at build time: -ldflags "-X main.relayVersion=<git describe>".
+var relayVersion = "dev"
 
 // gatewayReadyFile is written under RELAY_STATE_DIR when the gateway is READY.
 const gatewayReadyFile = "gateway-ready"

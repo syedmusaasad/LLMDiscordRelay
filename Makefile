@@ -7,6 +7,7 @@ BIN       := bin/relay
 MODULE    := github.com/syedmusaasad/LLMDiscordRelay
 GOOS      ?= linux
 GOARCH    ?= amd64
+VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
 # Optional: run a specific integration test by name
 T ?=
@@ -19,7 +20,7 @@ all: build
 build:
 	@mkdir -p bin
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) \
-	  go build -trimpath -ldflags="-s -w" -o $(BIN) ./cmd/relay
+	  go build -trimpath -ldflags="-s -w -X main.relayVersion=$(VERSION)" -o $(BIN) ./cmd/relay
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) \
 	  go build -trimpath -ldflags="-s -w" -o bin/llmux ./cmd/llmux
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) \
