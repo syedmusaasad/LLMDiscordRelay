@@ -230,14 +230,33 @@ func (p *pendingInteractionStore) put(id string, entry pendingInteraction) {
 	p.entries[id] = entry
 }
 
-func (p *pendingInteractionStore) take(id string) (pendingInteraction, bool) {
+// claim atomically takes ownership of the whole request id belongs to: the
+// entry itself and every sibling entry on the same Discord message (the
+// Approve/Deny pair), under one lock. Exactly one of any number of concurrent
+// callers (button clicks, timeout, retirement) gets ok=true; the rest see
+// nothing and must not touch the pane. ids lists the removed custom IDs so a
+// failed action can restore them.
+func (p *pendingInteractionStore) claim(id string) (entry pendingInteraction, ids []string, ok bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	entry, ok := p.entries[id]
-	if ok {
-		delete(p.entries, id)
+	entry, ok = p.entries[id]
+	if !ok {
+		return pendingInteraction{}, nil, false
 	}
-	return entry, ok
+	for sid, e := range p.entries {
+		if e.threadID == entry.threadID && e.messageID == entry.messageID {
+			delete(p.entries, sid)
+			ids = append(ids, sid)
+		}
+	}
+	return entry, ids, true
+}
+
+// restore re-arms a claimed request (its action could not be carried out).
+func (p *pendingInteractionStore) restore(ids []string, entry pendingInteraction) {
+	for _, id := range ids {
+		p.put(id, entry)
+	}
 }
 
 // retire removes every pending entry of (thread, target, kind) that is not
@@ -1229,10 +1248,9 @@ func (w *Watcher) postApproval(threadID, target, signature string) bool {
 		case <-w.runCtx.Done():
 			return
 		case <-timer.C:
-			if _, ok := w.pendingInteractions.take(approveID); !ok {
-				return
+			if _, _, ok := w.pendingInteractions.claim(approveID); !ok {
+				return // a click or retirement claimed the pair first
 			}
-			w.pendingInteractions.take(denyID)
 			w.pendingInteractions.markResolved(threadID, target, "approval")
 			if !w.paneStillShows(entry) {
 				_ = w.discordEditComponents(threadID, msg.ID, "⌛ **Permission request expired** (the prompt is no longer on screen).", nil)
@@ -1274,7 +1292,7 @@ func (w *Watcher) postQuestion(threadID, target string, q inject.Question) bool 
 		select {
 		case <-w.runCtx.Done():
 		case <-timer.C:
-			if _, ok := w.pendingInteractions.take(id); !ok {
+			if _, _, ok := w.pendingInteractions.claim(id); !ok {
 				return // answered or retired meanwhile
 			}
 			w.pendingInteractions.markResolved(threadID, target, "question")
@@ -1374,10 +1392,9 @@ func (w *Watcher) askTrust(ctx context.Context, target, channelID string) bool {
 			if absent++; absent < promptAbsentPolls {
 				continue
 			}
-			if _, ok := w.pendingInteractions.take(approveID); !ok {
+			if _, _, ok := w.pendingInteractions.claim(approveID); !ok {
 				return <-result // a click is being handled
 			}
-			w.pendingInteractions.take(denyID)
 			if err := w.discordEditComponents(channelID, msg.ID, "⌛ **Trust request expired** (the dialog is no longer on screen).", nil); err != nil {
 				log.Printf("mirror: edit retired trust approval: %v", err)
 			}
@@ -1385,14 +1402,14 @@ func (w *Watcher) askTrust(ctx context.Context, target, channelID string) bool {
 			// the pane became ready or exited.
 			return true
 		case <-timeout.C:
-			if _, ok := w.pendingInteractions.take(approveID); !ok {
+			if _, _, ok := w.pendingInteractions.claim(approveID); !ok {
 				return <-result // an interaction won the race
 			}
-			w.pendingInteractions.take(denyID)
 			return deny("⛔ **Trust denied automatically** (approval timeout).")
 		case <-ctx.Done():
-			w.pendingInteractions.take(approveID)
-			w.pendingInteractions.take(denyID)
+			if _, _, ok := w.pendingInteractions.claim(approveID); !ok {
+				return <-result // a click already owns the request
+			}
 			return deny("⛔ **Trust request cancelled.**")
 		}
 	}
@@ -1412,18 +1429,26 @@ func (w *Watcher) handleInteraction(ev InteractionEvent) {
 	if !inject.ShouldAcceptAuthor(ev.AuthorID, ev.IsBot, w.cfg.AllowedUserID) {
 		return
 	}
-	entry, ok := w.pendingInteractions.take(ev.CustomID)
+	// Claim the whole request (both buttons of a pair) atomically before any
+	// pane action: concurrent clicks and the timeout race for it, one wins.
+	entry, claimed, ok := w.pendingInteractions.claim(ev.CustomID)
 	if !ok || entry.threadID != ev.ChannelID {
+		if ok {
+			w.pendingInteractions.restore(claimed, entry) // another channel's request
+		}
 		return
 	}
 	switch entry.kind {
 	case "trust":
 		approve := strings.Contains(ev.CustomID, ":approve:")
-		other := strings.Replace(ev.CustomID, ":deny:", ":approve:", 1)
-		if approve {
-			other = strings.Replace(ev.CustomID, ":approve:", ":deny:", 1)
+		// Validate at click time: the dialog may have been answered in the
+		// terminal since the last poll. Never send keys into whatever is on screen now.
+		if !w.paneStillShows(entry) {
+			_ = w.discordEditComponents(entry.threadID, entry.messageID, "⌛ **Trust request expired** (the dialog is no longer on screen).", nil)
+			// awaitReady keeps polling and sees whether the pane became ready or exited.
+			entry.result <- true
+			return
 		}
-		w.pendingInteractions.take(other)
 		recipe, note := tmuxctl.TrustDenyRecipe, "⛔ **Trust denied.**"
 		if approve {
 			recipe, note = tmuxctl.TrustAcceptRecipe, "✅ **Folder trusted.**"
@@ -1436,37 +1461,33 @@ func (w *Watcher) handleInteraction(ev InteractionEvent) {
 		entry.result <- approve
 	case "approval":
 		approve := strings.Contains(ev.CustomID, ":approve:")
-		other := strings.Replace(ev.CustomID, ":approve:", ":deny:", 1)
 		recipe, note := tmuxctl.ApprovalDenyRecipe, "⛔ **Permission denied**."
 		if approve {
 			recipe, note = tmuxctl.ApprovalApproveRecipe, "✅ **Permission approved**."
-		} else {
-			other = strings.Replace(ev.CustomID, ":deny:", ":approve:", 1)
 		}
 		// A button only acts on the prompt it was posted for: if the pane moved on
 		// (answered locally, or a different action is showing), retire the pair.
 		if !w.paneStillShows(entry) {
-			w.pendingInteractions.take(other)
 			w.pendingInteractions.markResolved(entry.threadID, entry.target, "approval")
 			_ = w.discordEditComponents(entry.threadID, entry.messageID, "⌛ **Permission request expired** (the prompt changed or was answered elsewhere).", nil)
 			return
 		}
 		if err := tmuxctl.SendRecipe(entry.target, recipe); err != nil {
 			log.Printf("mirror: approval recipe: %v", err)
-			w.pendingInteractions.put(ev.CustomID, entry) // keep the button usable
+			w.pendingInteractions.restore(claimed, entry) // keep the buttons usable
 			return
 		}
-		// Both buttons share one stamp: resolving either retires the pair, which
-		// also disarms the timeout goroutine (it finds nothing to take).
-		w.pendingInteractions.take(other)
 		w.pendingInteractions.markResolved(entry.threadID, entry.target, "approval")
 		_ = w.discordEditComponents(entry.threadID, entry.messageID, note, nil)
 	case "question":
-		if len(ev.Values) != 1 {
-			return
+		option := -1
+		if len(ev.Values) == 1 {
+			if n, err := strconv.Atoi(ev.Values[0]); err == nil {
+				option = n
+			}
 		}
-		option, err := strconv.Atoi(ev.Values[0])
-		if err != nil || option < 0 || option >= entry.options {
+		if option < 0 || option >= entry.options {
+			w.pendingInteractions.restore(claimed, entry) // malformed click: keep the picker live
 			return
 		}
 		if !w.paneStillShows(entry) {
