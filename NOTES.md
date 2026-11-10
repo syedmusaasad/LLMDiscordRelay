@@ -20,3 +20,25 @@ Phase 2: tracked tree not fully clean before push: install.sh (mode 644->755 onl
 - Product fixes the tests exposed: echo suppression (watcher.go) swallowed the only "You:" echo after a retried
   injection; install.sh and the systemd unit still installed dpmux / devpass names and set RELAY_DPMUX_BIN.
 - go.mod/go.sum: modernc.org/sqlite dropped (`go mod tidy`), nothing imports it any more.
+
+## Phase 3: live smoke against real Claude Code (2.1.322)
+
+- `bash test/live/claude_smoke.sh` (33 checks, ~3 min, not CI): isolated tmux socket via TMUX_TMPDIR, temp state dir,
+  throwaway project under /tmp, trust dialog accepted through the relay's approval message, haiku/low/default-permissions.
+  Helpers: test/live/mockctl.py (mock-discord control), test/live/refusal (runs inject.IsResumeRefused on a pane).
+- Product bugs the live run exposed and this commit fixes:
+  1. inject.SendText (single line): Enter was sent a few ms after the literal text; real Claude Code left the prompt typed
+     but unsubmitted on fresh/resumed panes (spawn then timed out after 60 s). A 150 ms settle now separates them.
+  2. relay loadEnv: with LLM_RELAY_ENV set it still migrated ~/.config/devpass-discord-relay/.env into the home config
+     dir. A readable LLM_RELAY_ENV now wins and nothing under $HOME is read or migrated.
+- mock-discord gained GET /control/calls (method, path, channel_id, assigned id, body) so a test can tell which thread got
+  which message; existing /control/sent is unchanged.
+- A dead pane whose only process is the exiting `claude` shows no text (tmux drops the output), so the refusal check
+  launches claude through a shim that prints its exit status. The relay itself still detects a refusal by the pane
+  signature or by the pane disappearing before ready.
+- Side effects left on the host: Claude Code records trust for each throwaway /tmp/llmlive-* dir in ~/.claude.json, and
+  leftover debug dirs from failed runs may remain (/tmp/llmlive-*, ~/.claude/projects/*llmlive*, -tmp-manualproj,
+  -tmp-probeproj-*); a passing script run removes its own.
+- INCIDENT (mine): while debugging by hand I ran `tmux kill-server` in a shell where $TMUX pointed at the host's default
+  tmux server (TMUX overrides TMUX_TMPDIR), so I killed the host's default tmux server and its sessions at ~14:05. A new
+  default server was running afterwards. The script now unsets TMUX and kills only its own socket explicitly (-S).

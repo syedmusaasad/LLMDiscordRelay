@@ -345,6 +345,11 @@ func discordComponents(components []mirror.Component) []discordgo.MessageCompone
 func loadEnv() error {
 	var paths []string
 	if v := os.Getenv("LLM_RELAY_ENV"); v != "" {
+		// An explicitly named file wins; when it loads, nothing under the
+		// home directory is read or migrated (isolated runs must not touch it).
+		if err := readDotEnv(v); err == nil {
+			return nil
+		}
 		paths = append(paths, v)
 	}
 	if home, err := os.UserHomeDir(); err == nil {

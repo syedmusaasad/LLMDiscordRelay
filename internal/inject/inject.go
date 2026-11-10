@@ -270,6 +270,11 @@ func SendText(target, text string) error {
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("inject: send-keys literal: %w: %s", err, out)
 		}
+		// Let the TUI consume the text before Enter arrives. Real Claude Code
+		// coalesces text and an Enter that follow within a few milliseconds
+		// into one paste-like chunk and then leaves the prompt typed but
+		// unsubmitted (seen live on freshly started and resumed panes).
+		time.Sleep(pasteSettle)
 	}
 	cmd2 := exec.Command(tmuxBin, "send-keys", "-t", target, "", "Enter")
 	if out, err := cmd2.CombinedOutput(); err != nil {
