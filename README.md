@@ -1,25 +1,26 @@
-# DevPassDiscordRelay
+# LLMDiscordRelay
 
-DevPassDiscordRelay connects local devpass-code tmux sessions to Discord threads for remote monitoring and interaction.
+LLMDiscordRelay mirrors Claude Code sessions running in tmux to private Discord threads and relays replies back to the terminal.
 
-The local tmux session serves as the sole source of truth. Discord acts as a remote mirror and an external input channel. All agent execution, state changes, and file edits occur on your host machine inside tmux. If the relay service crashes or disconnects, your terminal session continues uninterrupted. When you return to the terminal, you retain full interactive control of the running session.
+The local tmux session acts as the source of truth. Discord provides a remote monitor and an external input interface. All execution, file modifications, and agent state reside on your host machine inside tmux. If the relay service stops or disconnects, your terminal session continues running without disruption.
 
 ```
 +------------------------------------------------------------------------+
 |                              Host Machine                              |
 |                                                                        |
 |  +--------------------+         read-only          +----------------+  |
-|  |   devpass-code     | -------------------------> |  opencode.db   |  |
-|  |   (inside tmux)    |                            |  (SQLite WAL)  |  |
+|  |     Claude Code    | -------------------------> |  JSONL Project |  |
+|  |    (inside tmux)   |                            |  Transcripts   |  |
 |  +--------------------+                            +----------------+  |
 |         ^          |                                       |           |
 | send-   |          | capture-pane                          | tail      |
-| keys    |          v (readiness/refusal)                   v rows      |
+| keys    |          v (readiness/prompts)                   v events    |
 |  +------------------------------------------------------------------+  |
-|  |                    DevPassDiscordRelay Daemon                    |  |
+|  |                     LLMDiscordRelay Daemon                       |  |
 |  |                                                                  |  |
-|  |   - Tails transcript parts from opencode.db                      |  |
+|  |   - Tails transcript events from JSONL session files             |  |
 |  |   - Inspects pane status with capture-pane                       |  |
+|  |   - Surfaces trust dialogs and approvals to Discord              |  |
 |  |   - Filters Discord events by DISCORD_USER_ID                    |  |
 |  +------------------------------------------------------------------+  |
 |                                |                                       |
@@ -31,45 +32,86 @@ The local tmux session serves as the sole source of truth. Discord acts as a rem
 |                                                                        |
 |  Channel: DISCORD_CHANNEL_ID                                           |
 |    |                                                                   |
-|    +-- Thread: ses_<session-id> (session mirror + user replies)        |
+|    +-- Thread: <session-id> (session mirror + user replies)            |
 +------------------------------------------------------------------------+
 ```
 
-## Transcript vs pane
+## Transcript vs Pane
 
-The relay divides session observability into content and state. The daemon tails transcript content from SQLite and reads operational state from tmux.
+The relay separates session content from operational state. The daemon tails transcript events from JSONL files and inspects interactive state from tmux.
 
-devpass-code version 1.18.11 persists conversation records exclusively in an SQLite database. The engine stores conversation records at ~/.local/share/devpass-code/opencode.db in WAL mode. It generates no per-session JSONL files on disk. The relay opens opencode.db with URI `file:<path>?mode=ro` to tail message and part rows. Content extraction reads user prompts, assistant turns, tool invocations, and tool results directly from this database.
+Claude Code stores conversation history in JSONL files located at `$CLAUDE_CONFIG_DIR/projects/<project-slug>/<session-id>.jsonl` (default: `~/.claude/projects/<project-slug>/<session-id>.jsonl`). Claude Code creates this file when the first prompt is submitted in the session. The relay opens the JSONL transcript with read-only access to stream user prompts, assistant responses, tool calls, and tool results. The relay never writes to transcript files.
 
-Terminal state relies strictly on tmux capture-pane. The relay never parses conversational prose from the terminal pane. Instead, the daemon invokes capture-pane to detect readiness markers, session refusals, and interactive approval prompts. Specifically, capture-pane confirms when the pane displays the "Ask anything..." prompt before keystroke injection. It also identifies "Error: Session not found" during failed session resumes, and detects "Permission required" prompts. State detection belongs to capture-pane, while message content belongs to opencode.db. The architecture strictly maintains this boundary.
+Operational state relies strictly on tmux `capture-pane`. The relay never parses conversational prose from the terminal pane. Instead, the daemon invokes `capture-pane` to detect readiness markers, directory trust dialogs, permission approvals, and interactive option pickers. State detection belongs to `capture-pane`, while conversation content belongs to the JSONL transcript files.
 
-## Discord structural difference and privacy
+## Trust Dialog and Interactive Prompts
 
-Discord bots cannot create message threads inside Direct Message channels. Discord restricts thread primitives to guild channels. For this reason, DevPassDiscordRelay requires a dedicated private server owned by you.
+Claude Code displays interactive prompts during operation:
 
-This structural constraint introduces a direct privacy boundary. If you invite the bot into a shared or multi-user server, other guild members could view your mirrored prompts, assistant outputs, and tool activity. You must run the bot inside a private server where you remain the sole human member. Limiting server membership prevents third parties from reading your terminal transcripts.
+- Directory trust check: When launched in an untrusted directory, Claude Code displays a safety prompt: "Quick safety check: Is this a project you created or one you trust?". The relay forwards this to Discord as an interactive message with Approve and Deny buttons. Clicking Approve sends Down and Enter keys to accept folder trust. Clicking Deny (or allowing the request to time out) sends Escape. The relay never auto-accepts trust dialogs.
+- Permission prompts: When Claude Code requests permission to run a command or access a tool, the relay displays the action block in Discord with Approve and Deny buttons. Clicking Approve sends "1", while clicking Deny (or timing out) sends Escape.
+- AskUserQuestion pickers: When Claude Code presents an interactive question prompt, the relay parses the options and presents selectable buttons in Discord.
 
-## Security posture
+## Discord Structural Difference and Privacy
 
-DevPassDiscordRelay makes the following security commitments and disclosures:
+Discord bots cannot create message threads inside Direct Message channels. Threads require a guild channel. For this reason, LLMDiscordRelay requires a dedicated private server owned by you.
 
-- Runs on your machine under your account: The daemon executes locally as an ordinary process of the account that installed it (a systemd user unit). It does not drop privileges itself, so anything it runs has your account's access.
-- Per-user token in .env never committed and backed up across reinstalls: Secrets live in ~/.config/devpass-discord-relay/.env outside source control. The install.sh script preserves this file during updates.
-- Single-user gating at the event layer: The relay refuses to start (non-zero exit, with a log line naming DISCORD_USER_ID) when DISCORD_USER_ID is unset or empty; there is no accept-everyone mode. Once running, the handler discards messages from every other user and from bots before processing.
-- Outbound only: The daemon establishes outbound TLS connections to Discord API endpoints. It opens no listening network ports on your machine.
-- Content goes only to your own private guild: The daemon forwards transcripts solely to the configured private server channel. No external metrics service receives conversation logs.
-- Telemetry is off unless you set TELEMETRY_URL: When TELEMETRY_URL is set, the relay POSTs once per UTC day (while running, not only at startup) a body containing only sha256(username)[:12] and the relay version. Nothing else is sent. Leave TELEMETRY_URL unset and nothing is sent.
+This structural constraint defines a privacy boundary. Inviting the bot into a multi-user server exposes your prompts, assistant replies, and tool execution logs to other server members. You must run the bot in a private server where your account is the sole member.
+
+## Security Posture
+
+LLMDiscordRelay maintains the following security boundaries:
+
+- Local execution under user account: The daemon runs as an unprivileged systemd user service (`llm-discord-relay.service`). It inherits your account's access permissions and does not escalate privileges.
+- Configuration security: Credentials reside in `~/.config/llm-discord-relay/.env` outside source control. The environment variable `LLM_RELAY_ENV` allows specifying an alternate path. The installer preserves this configuration during updates.
+- State storage: Session state and pending markers reside in `~/.llm-discord-relay`.
+- Single-user gating: The relay exits immediately if `DISCORD_USER_ID` is unset or empty. The daemon drops events originating from other users or bots at the gateway boundary.
+- Outbound network traffic only: The daemon establishes outbound TLS connections to the Discord Gateway and REST API. It opens no listening network ports on the host.
+- Restricted telemetry: Telemetry is disabled by default. If `TELEMETRY_URL` is set, the daemon sends at most one HTTP POST per UTC day containing only `sha256(username)[:12]` and the relay version string.
 
 ## Usage
 
-Start a session with dpmux to initiate mirroring:
+Start a mirrored Claude Code session with `llmux`:
 
 ```bash
-dpmux
+llmux
 ```
 
-List active sessions managed by the relay:
+Pass arguments or an initial prompt directly:
 
 ```bash
-dpmux ls
+llmux "Explain this repository architecture"
+```
+
+Resume an existing session using its identifier:
+
+```bash
+llmux --resume 11111111-2222-4333-8444-555555555555
+```
+
+List active sessions tracked by the relay:
+
+```bash
+llmux ls
+```
+
+Configure the agent command by setting `RELAY_AGENT_CMD` (default: `claude`):
+
+```bash
+export RELAY_AGENT_CMD="claude"
+# Alternatively, specify a wrapper or alternative agent:
+export RELAY_AGENT_CMD="pl"
+```
+
+## Migration from Legacy Versions
+
+When upgrading from pre-1.0 relay releases:
+
+- Configuration migration: On initial startup, if `~/.config/llm-discord-relay/.env` does not exist, the daemon automatically copies your existing `.env` from the previous configuration directory. The original file remains untouched.
+- Service switch: Stop and disable the retired systemd user service before enabling the new service:
+
+```bash
+systemctl --user disable --now <legacy-service-name>.service
+systemctl --user daemon-reload
+systemctl --user enable --now llm-discord-relay.service
 ```
