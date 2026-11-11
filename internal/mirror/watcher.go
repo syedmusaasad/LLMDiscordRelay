@@ -498,6 +498,9 @@ type spawnMarkerJSON struct {
 	// spawnResume) launched llmux and therefore owns the marker: it decides
 	// bind, timeout and cleanup. scanSessions never claims an owned marker.
 	Owner string `json:"owner,omitempty"`
+	// AgentCmd is the RELAY_AGENT_CMD string llmux used (empty when unset). It
+	// is stored on the session record so a resume runs the same agent.
+	AgentCmd string `json:"agentCmd,omitempty"`
 }
 
 // markerOwnerSpawn is the Owner value llmux records for the relay's own spawn paths.
@@ -587,18 +590,18 @@ func (w *Watcher) scanSessions(ctx context.Context, seen map[string]bool) {
 		}
 		seen[m.SessionID] = true
 
-		go func(sessionID, tmuxTarget, pendingPath string) {
+		go func(sessionID, tmuxTarget, pendingPath, agentCmd string) {
 			defer os.Remove(pendingPath) // clean up marker
 
-			if err := w.mirrorSession(ctx, sessionID, tmuxTarget); err != nil {
+			if err := w.mirrorSession(ctx, sessionID, tmuxTarget, agentCmd); err != nil {
 				log.Printf("mirror: session %s error: %v", sessionID, err)
 			}
-		}(m.SessionID, m.Target, m.path)
+		}(m.SessionID, m.Target, m.path, m.AgentCmd)
 	}
 }
 
 // mirrorSession mirrors a single session to Discord.
-func (w *Watcher) mirrorSession(ctx context.Context, sessionID, tmuxTarget string) error {
+func (w *Watcher) mirrorSession(ctx context.Context, sessionID, tmuxTarget, agentCmd string) error {
 	log.Printf("mirror: attaching session %s target=%s", sessionID, tmuxTarget)
 
 	// Create thread root message
@@ -624,6 +627,7 @@ func (w *Watcher) mirrorSession(ctx context.Context, sessionID, tmuxTarget strin
 		ThreadRootID: rootMsg.ID,
 		ChannelID:    w.cfg.ChannelID,
 		Status:       "active",
+		AgentCmd:     agentCmd,
 	}
 	if err := w.sessions.Upsert(rec); err != nil {
 		log.Printf("mirror: sessions.json upsert: %v", err)
@@ -1776,6 +1780,7 @@ func (w *Watcher) resumeDeadSession(ctx context.Context, rec *SessionRecord, con
 
 	// Resume succeeded: update the session record with the new tmux target.
 	rec.TmuxTarget = newTarget
+	rec.Status = "active"
 	if err := w.sessions.Upsert(rec); err != nil {
 		log.Printf("mirror: update sessions.json after resume: %v", err)
 	}
@@ -1797,9 +1802,13 @@ func (w *Watcher) resumeDeadSession(ctx context.Context, rec *SessionRecord, con
 // the two refusal signals; any other failure to become ready is an error (the
 // pane is torn down).
 func (w *Watcher) spawnResumeReady(ctx context.Context, rec *SessionRecord) (target string, refused bool, err error) {
-	target, err = w.spawnResume(ctx, rec.SessionID)
+	target, markerAgent, err := w.spawnResume(ctx, rec.SessionID, rec.AgentCmd)
 	if err != nil {
 		return "", false, fmt.Errorf("spawn resume: %w", err)
+	}
+	// A resume never erases a stored agent command.
+	if rec.AgentCmd == "" && markerAgent != "" {
+		rec.AgentCmd = markerAgent
 	}
 	readyErr := w.awaitReady(ctx, target, rec.ThreadID)
 	switch {
@@ -1845,13 +1854,16 @@ func (w *Watcher) llmuxEnv() []string {
 
 // runLlmux runs llmux with args and returns the session name it prints, plus
 // the parsed pending marker.
-func (w *Watcher) runLlmux(ctx context.Context, args ...string) (sessionName string, marker spawnMarkerJSON, pendingPath string, err error) {
+func (w *Watcher) runLlmux(ctx context.Context, agentCmd string, args ...string) (sessionName string, marker spawnMarkerJSON, pendingPath string, err error) {
 	llmuxBin, err := w.llmuxPath()
 	if err != nil {
 		return "", marker, "", err
 	}
 	cmd := exec.CommandContext(ctx, llmuxBin, args...)
 	cmd.Env = w.llmuxEnv()
+	if agentCmd != "" {
+		cmd.Env = setEnvVar(cmd.Env, "RELAY_AGENT_CMD", agentCmd)
+	}
 	var stdoutBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = os.Stderr
@@ -1874,22 +1886,24 @@ func (w *Watcher) runLlmux(ctx context.Context, args ...string) (sessionName str
 	return sessionName, marker, pendingPath, nil
 }
 
-// spawnResume launches llmux --resume <sessionID> and returns the new tmux target.
-func (w *Watcher) spawnResume(ctx context.Context, sessionID string) (string, error) {
+// spawnResume launches llmux --resume <sessionID> and returns the new tmux
+// target and the agent command the marker records. A non-empty agentCmd is the
+// session's stored agent and is passed to llmux as RELAY_AGENT_CMD.
+func (w *Watcher) spawnResume(ctx context.Context, sessionID, agentCmd string) (string, string, error) {
 	if !transcript.ValidSessionID(sessionID) {
-		return "", fmt.Errorf("refusing to resume malformed session id %q", sessionID)
+		return "", "", fmt.Errorf("refusing to resume malformed session id %q", sessionID)
 	}
 	log.Printf("mirror: spawnResume: llmux --resume %s", sessionID)
-	sessionName, marker, pendingPath, err := w.runLlmux(ctx, "--resume", sessionID)
+	sessionName, marker, pendingPath, err := w.runLlmux(ctx, agentCmd, "--resume", sessionID)
 	if err != nil {
 		if sessionName != "" {
-			return sessionName + ":0.0", nil // marker unreadable; fall back to the default target
+			return sessionName + ":0.0", "", nil // marker unreadable; fall back to the default target
 		}
-		return "", err
+		return "", "", err
 	}
 	// The relay already tracks this session; the marker has served its purpose.
 	os.Remove(pendingPath)
-	return marker.Target, nil
+	return marker.Target, marker.AgentCmd, nil
 }
 
 var (
@@ -2147,7 +2161,7 @@ func (w *Watcher) handleSpawnFromDiscord(ctx context.Context, content string, ev
 	spawnStartMS := time.Now().UnixMilli()
 	log.Printf("mirror: spawning llmux (spawnStart=%d)", spawnStartMS)
 
-	sessionName, marker, pendingPath, runErr := w.runLlmux(ctx)
+	sessionName, marker, pendingPath, runErr := w.runLlmux(ctx, "")
 	if sessionName == "" {
 		return fmt.Errorf("llmux run: %w", runErr)
 	}
@@ -2225,16 +2239,17 @@ func (w *Watcher) handleSpawnFromDiscord(ctx context.Context, content string, ev
 			SessionID:  sessionID,
 			TmuxTarget: tmuxTarget,
 			Status:     "active",
+			AgentCmd:   marker.AgentCmd,
 		}); err != nil {
 			log.Printf("mirror: sessions.json pre-upsert for %s: %v", sessionID, err)
 		}
 
 		// Mirror the session concurrently (same as scanSessions does).
-		go func(sid, target string) {
-			if err := w.mirrorSession(ctx, sid, target); err != nil {
+		go func(sid, target, agentCmd string) {
+			if err := w.mirrorSession(ctx, sid, target, agentCmd); err != nil {
 				log.Printf("mirror: mirrorSession(spawn) %s: %v", sid, err)
 			}
-		}(sessionID, tmuxTarget)
+		}(sessionID, tmuxTarget, marker.AgentCmd)
 	}
 
 	return nil

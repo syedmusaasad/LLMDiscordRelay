@@ -287,11 +287,12 @@ func runLS() error {
 // is chosen by llmux (claude --session-id / --resume), so the marker carries the
 // identity directly and nothing has to be inferred later.
 type pendingMarker struct {
-	Target       string `json:"target"`           // tmux target (e.g. "llm-123:0.0")
-	SpawnInstant int64  `json:"spawnInstant"`     // time.Now().UnixMilli() when marker was written
-	SessionID    string `json:"sessionID"`        // Claude Code session id of this launch
-	Resume       bool   `json:"resume,omitempty"` // true for `--resume <id>`: the transcript already exists
-	Owner        string `json:"owner,omitempty"`  // $RELAY_MARKER_OWNER: set when the relay's own spawn path owns the marker; the scanner never claims it
+	Target       string `json:"target"`             // tmux target (e.g. "llm-123:0.0")
+	SpawnInstant int64  `json:"spawnInstant"`       // time.Now().UnixMilli() when marker was written
+	SessionID    string `json:"sessionID"`          // Claude Code session id of this launch
+	Resume       bool   `json:"resume,omitempty"`   // true for `--resume <id>`: the transcript already exists
+	Owner        string `json:"owner,omitempty"`    // $RELAY_MARKER_OWNER: set when the relay's own spawn path owns the marker; the scanner never claims it
+	AgentCmd     string `json:"agentCmd,omitempty"` // $RELAY_AGENT_CMD as given (empty when unset): the relay resumes the session with it
 }
 
 // launchPlan is what llmux will run for one invocation.
@@ -398,6 +399,7 @@ func runLaunch(args []string) error {
 				SessionID:    plan.SessionID,
 				Resume:       plan.Resume,
 				Owner:        os.Getenv("RELAY_MARKER_OWNER"),
+				AgentCmd:     os.Getenv("RELAY_AGENT_CMD"),
 			}
 			if err := writePendingMarker(pendingPath, marker); err != nil {
 				return fmt.Errorf("write pending marker: %w", err)
@@ -432,6 +434,7 @@ func runLaunch(args []string) error {
 		SessionID:    plan.SessionID,
 		Resume:       plan.Resume,
 		Owner:        os.Getenv("RELAY_MARKER_OWNER"),
+		AgentCmd:     os.Getenv("RELAY_AGENT_CMD"),
 	}
 	if err := writePendingMarker(pendingPath, marker); err != nil {
 		return fmt.Errorf("write pending marker: %w", err)

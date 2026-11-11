@@ -17,6 +17,9 @@ type SessionRecord struct {
 	ChannelID    string `json:"channel_id"`
 	Status       string `json:"status"` // "active", "ended"
 	UpdatedAt    int64  `json:"updated_at"`
+	// AgentCmd is the RELAY_AGENT_CMD the session was started with (empty when
+	// unset). A relay resume runs llmux with it.
+	AgentCmd string `json:"agent_cmd,omitempty"`
 }
 
 // Sessions is a thread-safe sessions.json store.

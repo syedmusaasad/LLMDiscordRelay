@@ -6,6 +6,8 @@ Release history for LLMDiscordRelay.
 
 ### Fixed
 - `llmux` now forwards the caller's `PATH` to the agent, so commands on extra `PATH` directories are found inside tmux.
+- A session resumed by the relay is stored as `active` again; it was left as `ended` after its dead pane's mirror finished.
+- A session resumed by the relay now comes back with the agent command it was started with (`RELAY_AGENT_CMD`, e.g. `pl llmux`) instead of plain `claude`. `llmux` records the command in the pending marker (`agentCmd`, optional) and the relay stores it on the session record (`agent_cmd`, optional); old markers and records keep working unchanged.
 
 ## [1.0.0] - 2026-11-10
 

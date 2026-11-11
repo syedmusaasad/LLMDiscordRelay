@@ -209,6 +209,10 @@ func TestScanSessionsPairsMarkerWithTranscript(t *testing.T) {
 	writeMarker("bad", spawnMarkerJSON{Target: "nosuch-bad:0.0", SessionID: "../../etc/passwd", Resume: true})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// The bound session's mirror goroutine writes sessions.json into the state
+	// dir until it has recorded the session as ended: let it finish before the
+	// temp dirs are removed.
+	t.Cleanup(func() { cancel(); waitSessionEnded(w, testSessionID) })
 	seen := map[string]bool{}
 	w.scanSessions(ctx, seen)
 	time.Sleep(100 * time.Millisecond)
@@ -246,6 +250,18 @@ func TestScanSessionsPairsMarkerWithTranscript(t *testing.T) {
 	rec := w.sessions.Get(testSessionID)
 	if rec == nil || rec.ThreadID != "thread-1" || rec.TmuxTarget != "nosuch-early:0.0" {
 		t.Fatalf("record = %+v", rec)
+	}
+}
+
+// waitSessionEnded waits (bounded) until a mirror goroutine has made its final
+// write of the session record.
+func waitSessionEnded(w *Watcher, sessionID string) {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if rec := w.sessions.Get(sessionID); rec != nil && rec.Status == "ended" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -296,10 +312,20 @@ func tmuxPane(t *testing.T, name, script string) string {
 		t.Skip("tmux not available")
 	}
 	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", name).Run() })
-	if out, err := exec.Command("tmux", "new-session", "-d", "-s", name, "-x", "100", "-y", "30", "sh", "-c", script).CombinedOutput(); err != nil {
-		t.Fatalf("tmux new-session: %v\n%s", err, out)
+	// tmux exits its server when the last session is killed; a new-session that
+	// connects while the old server is shutting down fails with "server exited
+	// unexpectedly". Retry: the next attempt starts a fresh server.
+	var out []byte
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		out, err = exec.Command("tmux", "new-session", "-d", "-s", name, "-x", "100", "-y", "30", "sh", "-c", script).CombinedOutput()
+		if err == nil {
+			return name + ":0.0"
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	return name + ":0.0"
+	t.Fatalf("tmux new-session: %v\n%s", err, out)
+	return ""
 }
 
 const testRule = "────────────────────────────────────────────────────────────────"

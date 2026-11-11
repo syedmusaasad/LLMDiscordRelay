@@ -318,6 +318,26 @@ func TestResolveAgentCmd(t *testing.T) {
 	}
 }
 
+func TestPendingMarkerCarriesAgentCmd(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pending-llm-1-3")
+	m := pendingMarker{Target: "llm-1-3:0.0", SessionID: "11111111-2222-4333-8444-555555555555", AgentCmd: "pl llmux"}
+	if err := writePendingMarker(path, m); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(path)
+	if !strings.Contains(string(data), `"agentCmd":"pl llmux"`) {
+		t.Fatalf("marker = %s", data)
+	}
+	// Unset: the field is omitted, so the marker is what old relays expect.
+	if err := writePendingMarker(path, pendingMarker{Target: "t:0.0"}); err != nil {
+		t.Fatal(err)
+	}
+	data, _ = os.ReadFile(path)
+	if strings.Contains(string(data), "agentCmd") {
+		t.Fatalf("empty agent command must be omitted: %s", data)
+	}
+}
+
 func TestWritePendingMarkerIsAtomicJSON(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "pending-llm-1-2")
 	m := pendingMarker{Target: "llm-1-2:0.0", SpawnInstant: 5, SessionID: "11111111-2222-4333-8444-555555555555", Resume: true}

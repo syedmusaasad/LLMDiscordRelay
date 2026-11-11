@@ -103,6 +103,8 @@ export RELAY_AGENT_CMD="claude"
 export RELAY_AGENT_CMD="pl"
 ```
 
+The agent command is part of the session: `llmux` records it in the pending marker and the relay stores it with the session, so a session resumed by the relay (a Discord reply to a session whose pane has died) comes back with the agent command it was started with, not the relay service's own `RELAY_AGENT_CMD`. That command must be findable on the relay service's `PATH` (see below). Sessions started without `RELAY_AGENT_CMD`, and sessions recorded before this field existed, resume as before.
+
 `llmux` passes its caller's `PATH` to the agent (tmux would otherwise give the agent the tmux server's stored environment). Sessions started by the relay service from Discord get the service's `PATH` instead: the unit sets `PATH=~/.local/bin:/usr/local/bin:/usr/bin:/bin`. To extend it, add a `PATH=` line to `~/.config/llm-discord-relay/.env`; `EnvironmentFile` values override the unit's `Environment=PATH` (verified). Write the complete value you want, then run `systemctl --user restart llm-discord-relay.service`.
 
 ## Migration from Legacy Versions
