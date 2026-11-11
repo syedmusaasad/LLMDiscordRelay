@@ -2,6 +2,11 @@
 
 Release history for LLMDiscordRelay.
 
+## [Unreleased]
+
+### Fixed
+- `llmux` now forwards the caller's `PATH` to the agent, so commands on extra `PATH` directories are found inside tmux.
+
 ## [1.0.0] - 2026-11-10
 
 ### Changed

@@ -508,6 +508,7 @@ var forwardedEnv = []string{
 	"RELAY_STATE_DIR",
 	"RELAY_CLAUDE_PROJECTS",
 	"CLAUDE_CONFIG_DIR",
+	"PATH",
 }
 
 // buildAgentCmd constructs the shell command string for tmux: an "env K=V ..."

@@ -103,6 +103,8 @@ export RELAY_AGENT_CMD="claude"
 export RELAY_AGENT_CMD="pl"
 ```
 
+`llmux` passes its caller's `PATH` to the agent (tmux would otherwise give the agent the tmux server's stored environment). Sessions started by the relay service from Discord get the service's `PATH` instead: the unit sets `PATH=~/.local/bin:/usr/local/bin:/usr/bin:/bin`. To extend it, add a `PATH=` line to `~/.config/llm-discord-relay/.env`; `EnvironmentFile` values override the unit's `Environment=PATH` (verified). Write the complete value you want, then run `systemctl --user restart llm-discord-relay.service`.
+
 ## Migration from Legacy Versions
 
 When upgrading from pre-1.0 relay releases:

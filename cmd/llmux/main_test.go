@@ -257,6 +257,7 @@ func TestBuildAgentCmd(t *testing.T) {
 	t.Setenv("RELAY_STATE_DIR", "/tmp/it's state")
 	t.Setenv("RELAY_CLAUDE_PROJECTS", "")
 	t.Setenv("FAKE_CLAUDE_UNTRUSTED", "1")
+	t.Setenv("PATH", "")
 	got := buildAgentCmd([]string{"/usr/bin/claude", "--model", "haiku"}, []string{"--session-id", "abc"})
 	want := `env RELAY_STATE_DIR='/tmp/it'\''s state' FAKE_CLAUDE_UNTRUSTED='1' '/usr/bin/claude' '--model' 'haiku' '--session-id' 'abc'`
 	if got != want {
@@ -264,6 +265,31 @@ func TestBuildAgentCmd(t *testing.T) {
 	}
 	if strings.Contains(got, "2>") || strings.Contains(got, "--print-logs") || strings.Contains(got, "--auto") {
 		t.Fatal("no stderr redirect or legacy flags")
+	}
+}
+
+func TestBuildAgentCmdForwardsPATH(t *testing.T) {
+	t.Setenv("RELAY_STATE_DIR", "")
+	t.Setenv("RELAY_CLAUDE_PROJECTS", "")
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("PATH", "/root/.system/bin:/opt/my tools/bin:/usr/bin")
+	got := buildAgentCmd([]string{"/usr/bin/claude"}, nil)
+	want := `env PATH='/root/.system/bin:/opt/my tools/bin:/usr/bin' '/usr/bin/claude'`
+	if got != want {
+		t.Fatalf("cmd = %s\nwant  %s", got, want)
+	}
+
+	t.Setenv("PATH", `/a/it's$HOME;b`)
+	got = buildAgentCmd([]string{"/usr/bin/claude"}, nil)
+	want = `env PATH='/a/it'\''s$HOME;b' '/usr/bin/claude'`
+	if got != want {
+		t.Fatalf("cmd = %s\nwant  %s", got, want)
+	}
+
+	t.Setenv("PATH", "")
+	got = buildAgentCmd([]string{"/usr/bin/claude"}, nil)
+	if strings.Contains(got, "PATH") || strings.Contains(got, "env ") {
+		t.Fatalf("empty PATH must add nothing: %s", got)
 	}
 }
 
