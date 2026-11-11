@@ -320,7 +320,11 @@ func TestResolveAgentCmd(t *testing.T) {
 
 func TestPendingMarkerCarriesAgentCmd(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "pending-llm-1-3")
-	m := pendingMarker{Target: "llm-1-3:0.0", SessionID: "11111111-2222-4333-8444-555555555555", AgentCmd: "pl llmux"}
+	t.Setenv("RELAY_AGENT_CMD", "pl llmux")
+	m := newPendingMarker("llm-1-3:0.0", launchPlan{SessionID: "11111111-2222-4333-8444-555555555555"})
+	if m.AgentCmd != "pl llmux" {
+		t.Fatalf("marker AgentCmd = %q", m.AgentCmd)
+	}
 	if err := writePendingMarker(path, m); err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +333,8 @@ func TestPendingMarkerCarriesAgentCmd(t *testing.T) {
 		t.Fatalf("marker = %s", data)
 	}
 	// Unset: the field is omitted, so the marker is what old relays expect.
-	if err := writePendingMarker(path, pendingMarker{Target: "t:0.0"}); err != nil {
+	t.Setenv("RELAY_AGENT_CMD", "")
+	if err := writePendingMarker(path, newPendingMarker("t:0.0", launchPlan{})); err != nil {
 		t.Fatal(err)
 	}
 	data, _ = os.ReadFile(path)

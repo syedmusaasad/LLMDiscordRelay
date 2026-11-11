@@ -47,9 +47,20 @@ var uuidRe = regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}
 // which the relay only pairs while the pane is alive.
 func writeMarker(t *testing.T, stateDir, name, target, sessionID string, resume bool) {
 	t.Helper()
-	data, err := json.Marshal(map[string]any{
+	writeMarkerAgent(t, stateDir, name, target, sessionID, resume, "")
+}
+
+// writeMarkerAgent is writeMarker for a session llmux started with
+// RELAY_AGENT_CMD=agentCmd (empty: the field is omitted, as llmux does).
+func writeMarkerAgent(t *testing.T, stateDir, name, target, sessionID string, resume bool, agentCmd string) {
+	t.Helper()
+	fields := map[string]any{
 		"target": target, "spawnInstant": time.Now().UnixMilli(), "sessionID": sessionID, "resume": resume,
-	})
+	}
+	if agentCmd != "" {
+		fields["agentCmd"] = agentCmd
+	}
+	data, err := json.Marshal(fields)
 	if err != nil {
 		t.Fatal(err)
 	}

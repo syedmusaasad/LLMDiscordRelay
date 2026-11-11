@@ -343,6 +343,19 @@ func planLaunch(args []string, newID func() string) (launchPlan, error) {
 	return launchPlan{SessionID: id, Args: append([]string{"--session-id", id}, rest...)}, nil
 }
 
+// newPendingMarker builds the marker llmux publishes for a launch: the target,
+// the plan's session, the marker owner and the RELAY_AGENT_CMD string as given.
+func newPendingMarker(target string, plan launchPlan) pendingMarker {
+	return pendingMarker{
+		Target:       target,
+		SpawnInstant: time.Now().UnixMilli(),
+		SessionID:    plan.SessionID,
+		Resume:       plan.Resume,
+		Owner:        os.Getenv("RELAY_MARKER_OWNER"),
+		AgentCmd:     os.Getenv("RELAY_AGENT_CMD"),
+	}
+}
+
 // runLaunch launches a new (or resumed) Claude Code session.
 func runLaunch(args []string) error {
 	stateDir, err := resolveStateDir()
@@ -393,14 +406,7 @@ func runLaunch(args []string) error {
 			// Write the pending marker BEFORE spawning so the relay can pair
 			// the session as soon as its first prompt creates the transcript.
 			pendingPath := filepath.Join(stateDir, "pending-"+sessionName)
-			marker := pendingMarker{
-				Target:       tmuxTarget,
-				SpawnInstant: time.Now().UnixMilli(),
-				SessionID:    plan.SessionID,
-				Resume:       plan.Resume,
-				Owner:        os.Getenv("RELAY_MARKER_OWNER"),
-				AgentCmd:     os.Getenv("RELAY_AGENT_CMD"),
-			}
+			marker := newPendingMarker(tmuxTarget, plan)
 			if err := writePendingMarker(pendingPath, marker); err != nil {
 				return fmt.Errorf("write pending marker: %w", err)
 			}
@@ -428,14 +434,7 @@ func runLaunch(args []string) error {
 
 	// Write pending marker BEFORE spawning.
 	pendingPath := filepath.Join(stateDir, "pending-"+sessionName)
-	marker := pendingMarker{
-		Target:       tmuxTarget,
-		SpawnInstant: time.Now().UnixMilli(),
-		SessionID:    plan.SessionID,
-		Resume:       plan.Resume,
-		Owner:        os.Getenv("RELAY_MARKER_OWNER"),
-		AgentCmd:     os.Getenv("RELAY_AGENT_CMD"),
-	}
+	marker := newPendingMarker(tmuxTarget, plan)
 	if err := writePendingMarker(pendingPath, marker); err != nil {
 		return fmt.Errorf("write pending marker: %w", err)
 	}

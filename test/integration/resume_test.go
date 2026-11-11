@@ -5,6 +5,7 @@
 package integration
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -182,12 +183,16 @@ func TestInvariant4_ResumeRefusalRetry(t *testing.T) {
 	setupMock(t, mockPort, mockGWPort)
 
 	sessionID := testSID(41)
-	seedDeadSession(t, projects, stateDir, "llm-refusal-test", sessionID, "Ready for refusal test")
+	// The session was started with fake-claude as its agent; the relay service
+	// has NO agent override of its own (RELAY_AGENT_CMD empty), so both resume
+	// launches only find an agent through the command stored with the session.
+	newTx(t, projects, sessionID).User("earlier question").Text("Ready for refusal test").TurnEnd()
+	writeMarkerAgent(t, stateDir, "llm-refusal-test", "llm-refusal-test:0.0", sessionID, true, fakeClaude)
 	wrapper, countFile := resumeWrapper(t, 1)
 
 	startRelay(t, relayBin, projects, stateDir, mockPort,
 		"DISCORD_USER_ID=user-refusal-001", "DISCORD_CHANNEL_ID=test-refusal-ch",
-		"RELAY_LLMUX_BIN="+wrapper, "RELAY_AGENT_CMD="+fakeClaude,
+		"RELAY_LLMUX_BIN="+wrapper, "RELAY_AGENT_CMD=",
 		"TMUX=", "TMUX_TMPDIR="+tmuxTmpDir)
 
 	var threadID string
@@ -222,6 +227,28 @@ func TestInvariant4_ResumeRefusalRetry(t *testing.T) {
 		}
 	}
 	t.Logf("llmux call count: %s (expected exactly 2)", count)
+
+	// The resume (and its retry) must not erase the stored agent command, and
+	// the live resumed session must not be stored as ended.
+	var records []struct {
+		SessionID string `json:"session_id"`
+		Status    string `json:"status"`
+		AgentCmd  string `json:"agent_cmd"`
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		records = nil
+		if data, err := os.ReadFile(filepath.Join(stateDir, "sessions.json")); err == nil {
+			json.Unmarshal(data, &records)
+		}
+		if len(records) == 1 && records[0].SessionID == sessionID && records[0].AgentCmd == fakeClaude && records[0].Status == "active" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("session record after resume = %+v; want agent_cmd=%q status=active", records, fakeClaude)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 // ── TestInvariant4_DoubleRefusalStartsFreshSession ───────────────────────────
